@@ -1,78 +1,155 @@
 [
   {
+    "path": "antv-infographic",
+    "name": "AntV Infographic",
+    "description": "Create data visualizations and infographics using AntV",
+    "category": "visualization",
+    "risk": "low"
+  },
+  {
+    "path": "code-reviewer",
+    "name": "Code Reviewer",
+    "description": "Review code for quality, best practices, and potential issues",
+    "category": "development",
+    "risk": "low"
+  },
+  {
+    "path": "doc-generator",
+    "name": "Documentation Generator",
+    "description": "Generate documentation from code and comments",
+    "category": "documentation",
+    "risk": "low"
+  },
+  {
+    "path": "error-analyzer",
+    "name": "Error Analyzer",
+    "description": "Analyze errors and suggest fixes",
+    "category": "debugging",
+    "risk": "low"
+  },
+  {
+    "path": "litellm-cadastrador",
+    "name": "LiteLLM Model Registrar",
+    "description": "Register and manage LiteLLM model configurations",
+    "category": "infrastructure",
+    "risk": "low"
+  },
+  {
     "path": "mc-operator",
     "name": "MC Operator",
-    "description": "Operate Mission Control (MC) boards via REST API. Manage tasks, board memory, comments, heartbeats, agents, board groups, and skill marketplace.",
+    "description": "Operate Mission Control boards via REST API",
     "category": "operations",
     "risk": "low"
   },
   {
-    "path": "repo-ecosystem-evaluator",
-    "name": "Repository Ecosystem Evaluator",
-    "description": "Evaluate repositories for architecture quality, semantic design coherence, and stack fit using standardized static metrics plus ATAM-lite and ISO/IEC 25010-aligned heuristics.",
-    "category": "analysis",
+    "path": "mineru",
+    "name": "MinerU Document Parser",
+    "description": "Parse PDF/Word/PPT/images to Markdown via MinerU API",
+    "category": "document-processing",
     "risk": "low"
   },
   {
     "path": "openclaw-agent-creator",
     "name": "OpenClaw Agent Creator",
-    "description": "Create and bootstrap new OpenClaw agents and their workspaces. Prepares SOUL.md, IDENTITY.md, TOOLS.md, BOOTSTRAP.md, HEARTBEAT.md and other workspace files.",
+    "description": "Create and bootstrap new OpenClaw agents and workspaces",
     "category": "infrastructure",
     "risk": "medium"
   },
   {
     "path": "openclaw-audit",
     "name": "OpenClaw Audit",
-    "description": "Audit an OpenClaw installation for security, configuration, and workspace content quality. Covers openclaw.json, agent workspace files, and security settings.",
+    "description": "Audit OpenClaw installation for security and configuration",
     "category": "security",
     "risk": "low"
   },
   {
-    "path": "serena-source-consultation",
-    "name": "Serena Source Consultation",
-    "description": "Use Serena plus local docs/source mirrors to verify real system behavior before making claims about architecture, configuration, hooks, or agent behavior.",
-    "category": "research",
+    "path": "openclaw-model-config",
+    "name": "OpenClaw Model Config",
+    "description": "Generate and manage OpenClaw model/provider configurations",
+    "category": "configuration",
+    "risk": "safe"
+  },
+  {
+    "path": "openclaw-session-governance",
+    "name": "OpenClaw Session Governance",
+    "description": "Audit and govern OpenClaw session lifecycle",
+    "category": "infrastructure",
     "risk": "low"
   },
   {
-    "path": "skill-creator",
-    "name": "Skill Creator",
-    "description": "Create new CLI skills following best practices with zero manual configuration. Automates brainstorming, template application, validation, and installation.",
-    "category": "meta",
+    "path": "openclaw-update",
+    "name": "OpenClaw Update",
+    "description": "Update OpenClaw gateway and CLI to latest version",
+    "category": "maintenance",
     "risk": "low"
   },
   {
     "path": "prompt-improver",
     "name": "Prompt Improver",
-    "description": "Analyze and improve prompts for LLM interactions. Applies prompt engineering best practices to increase clarity, specificity, and output quality.",
+    "description": "Improve prompts applying prompt engineering techniques",
     "category": "productivity",
     "risk": "low"
   },
   {
-    "path": "mineru",
-    "name": "MinerU Document Parser",
-    "description": "Parse PDF, Word, PPT, and images to Markdown via the MinerU API. Supports formulas, tables, and OCR. Ideal for academic papers and document extraction.",
-    "category": "document-processing",
+    "path": "repo-ecosystem-evaluator",
+    "name": "Repository Ecosystem Evaluator",
+    "description": "Evaluate repositories for architecture quality and stack fit",
+    "category": "analysis",
+    "risk": "low"
+  },
+  {
+    "path": "serena-source-consultation",
+    "name": "Serena Source Consultation",
+    "description": "Consult source code to verify system behavior",
+    "category": "research",
     "risk": "low"
   },
   {
     "path": "skill-check",
     "name": "SkillCheck",
-    "description": "Validate Claude Code skills against the agentskills specification. Catches structural, semantic, and naming issues before users do.",
+    "description": "Validate Claude Code skills against agentskills specification",
+    "category": "development",
+    "risk": "safe"
+  },
+  {
+    "path": "skill-creator",
+    "name": "Skill Creator",
+    "description": "Create new CLI skills following best practices",
     "category": "meta",
-    "risk": "low"
+    "risk": "safe"
+  },
+  {
+    "path": "skill-scanner",
+    "name": "Skill Scanner",
+    "description": "Scan and analyze skills for security and quality",
+    "category": "security",
+    "risk": "safe"
   },
   {
     "path": "skills-discovery",
     "name": "Skills Discovery",
-    "description": "Search for and install Agent Skills that give you specialized capabilities. Proactively identifies when a skill would improve task quality.",
+    "description": "Search for and install Agent Skills",
     "category": "meta",
+    "risk": "low"
+  },
+  {
+    "path": "task-decomposer",
+    "name": "Task Decomposer",
+    "description": "Break down complex tasks into manageable steps",
+    "category": "productivity",
+    "risk": "low"
+  },
+  {
+    "path": "taskmaster-setup",
+    "name": "TaskMaster Setup",
+    "description": "Configure TaskMaster AI with LiteLLM proxy",
+    "category": "infrastructure",
     "risk": "low"
   },
   {
     "path": "task-tracker-openclaw-skill",
     "name": "Task Tracker",
-    "description": "Personal task management with daily standups and weekly reviews. Supports Work and Personal tasks from Obsidian-based workflows.",
+    "description": "Personal task management with daily standups and weekly reviews",
     "category": "productivity",
     "risk": "low"
   }

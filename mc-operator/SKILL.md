@@ -27,6 +27,37 @@ Operate Mission Control (MC) boards via REST API. Use when an AI session needs t
 
 Set these in your workspace `TOOLS.md` or environment.
 
+## Local Docker Access (Quick Start)
+
+MC runs via Docker. The token lives in the container's env vars. **The bootstrap step is mandatory** — without it every call returns 401 even with a valid token.
+
+```bash
+# 1. Get the token from the running container
+TOKEN=$(docker inspect openclaw-mission-control-backend-1 \
+  --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | grep LOCAL_AUTH_TOKEN | cut -d= -f2)
+
+# 2. Bootstrap — creates the session cookie (REQUIRED before any other call)
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' \
+  http://localhost:8001/api/v1/auth/bootstrap \
+  -c /tmp/mc_cookies.txt
+
+# 3. Use the API normally — always pass both token AND cookie
+curl -s \
+  -H "Authorization: Bearer $TOKEN" \
+  -b /tmp/mc_cookies.txt \
+  http://localhost:8001/api/v1/boards | python3 -m json.tool
+```
+
+**Key points:**
+- Token source: `docker inspect openclaw-mission-control-backend-1` → env var `LOCAL_AUTH_TOKEN`
+- Bootstrap (`-c /tmp/mc_cookies.txt`) must be called once per session before any other endpoint
+- All subsequent calls need **both** `-H "Authorization: Bearer $TOKEN"` and `-b /tmp/mc_cookies.txt`
+- Cookie file `/tmp/mc_cookies.txt` is reusable within the same shell session
+
 ## Authentication
 
 All endpoints require a bearer token:
@@ -39,7 +70,7 @@ AUTH="Authorization: Bearer $AUTH_TOKEN"
 
 There are two authentication contexts:
 
-1. **Admin/lead token** (`LOCAL_AUTH_TOKEN` from `~/code/openclaw-mission-control/backend/.env`): authenticates as organization admin. Use `/api/v1/` endpoints (boards, tasks, tags, memory, etc.). The `/api/v1/agent/*` paths return 401 with this token.
+1. **Admin/lead token** (`LOCAL_AUTH_TOKEN` — retrieved at runtime via `docker inspect openclaw-mission-control-backend-1`, or from `~/code/openclaw-mission-control/backend/.env`): authenticates as organization admin. Use `/api/v1/` endpoints (boards, tasks, tags, memory, etc.). The `/api/v1/agent/*` paths return 401 with this token.
 
 2. **Agent token** (issued by MC when an agent is registered on a board): authenticates as a specific agent. Use `/api/v1/agent/*` endpoints (agent-worker scoped). Agents like Axion and SkillDoc use this path.
 

@@ -125,6 +125,7 @@ def main() -> None:
             apply=True,
             semantic_enabled=not args.deterministic_only,
             model=args.model,
+            mc_enabled=True,
         )
         entry = build_result_entry(payload)
         state["pending_successes"] += 1

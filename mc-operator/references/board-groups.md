@@ -16,6 +16,23 @@ A board belongs to **at most 1 group** (`board_group_id` nullable).
 
 ---
 
+## Active Groups (estado 2026-04-11)
+
+| Group | ID | Slug | Boards |
+|---|---|---|---|
+| AI Stack | `d09b5997-a165-4188-84f1-ddd9475fc49c` | `ai-stack` | Agent Architecture, Models & Cost, Knowledge & RAG, Prompts & Docs |
+| Platform | `274b701b-190c-4b5b-9d93-147826b04f29` | `platform` | Infrastructure Baseline, Governance & Gates, Integrations |
+| Ops & Work | `caa6b43c-82a7-42fd-8b17-5f65c4472fbd` | `ops-work` | External Triage, UNIP Operations |
+
+Boards sem grupo: **Experimental** (board isolado, sem grupo permanente).
+
+**Lógica de agrupamento:**
+- **AI Stack**: boards que constroem e operam o sistema de IA (agentes, modelos, conhecimento, prompts). Alta interdependência — um agente em qualquer desses boards precisa de contexto dos outros.
+- **Platform**: camada de infraestrutura e governança que os demais boards dependem (Infra é pré-requisito, Governance define regras, Integrations estende).
+- **Ops & Work**: boards de trabalho operacional e de domínio (triagem de insumos e tarefas UNIP).
+
+---
+
 ## 2. Endpoint Table
 
 | Action | Method | Path | Auth | Who uses |

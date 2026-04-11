@@ -145,6 +145,58 @@ curl -fsS "$BASE_URL/api/v1/skills/marketplace?gateway_id=$GATEWAY_ID" \
 
 ---
 
+## ozp Skills Pack — Fluxo Operacional
+
+O pack público `ozp/openclaw-skills` já está registrado e sincronizado no MC.
+
+| Item | Valor |
+|---|---|
+| Repo | https://github.com/ozp/openclaw-skills |
+| Local | `/home/ozp/code/openclaw-skills/` |
+| Pack ID | `90b5260b-c221-4296-b2c5-6fa064722aac` |
+| Branch | `main` |
+
+### Adicionar uma nova skill ao pack
+
+```bash
+# 1. Copiar skill para o repo local
+cp -r /home/ozp/clawd/skills/<nome-da-skill> /home/ozp/code/openclaw-skills/
+
+# 2. Adicionar entrada no skills_index.json
+# Editar /home/ozp/code/openclaw-skills/skills_index.json e adicionar:
+# { "path": "<nome-da-skill>", "name": "...", "description": "...", "category": "...", "risk": "low" }
+
+# 3. Commitar e enviar para o GitHub
+cd /home/ozp/code/openclaw-skills
+git add -A && git commit -m 'feat: add <nome-da-skill>'
+git push
+
+# 4. Resincronizar no MC (descobre e importa a nova skill automaticamente)
+TOKEN=$(grep LOCAL_AUTH_TOKEN ~/code/openclaw-mission-control/backend/.env | cut -d= -f2)
+curl -fsS -X POST "http://localhost:8001/api/v1/skills/packs/90b5260b-c221-4296-b2c5-6fa064722aac/sync" \
+  -H "Authorization: Bearer $TOKEN" | jq '{synced, created, updated, warnings}'
+```
+
+### Instalar skill no gateway após sync
+
+```bash
+TOKEN=$(grep LOCAL_AUTH_TOKEN ~/code/openclaw-mission-control/backend/.env | cut -d= -f2)
+GW=2e5ea409-bdcb-4a3d-91a4-70ad9ad6e307
+PACK=90b5260b-c221-4296-b2c5-6fa064722aac
+
+# Encontrar o ID da skill no marketplace
+SKILL_ID=$(curl -fsS "http://localhost:8001/api/v1/skills/marketplace?gateway_id=$GW&pack_id=$PACK" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.[] | select(.name=="<Nome da Skill>") | .id')
+
+# Instalar
+curl -fsS -X POST "http://localhost:8001/api/v1/skills/marketplace/$SKILL_ID/install?gateway_id=$GW" \
+  -H "Authorization: Bearer $TOKEN" | jq '.'
+```
+
+> Se o gateway estiver offline no momento do install, a API retorna 502. Aguardar o gateway agent estar online (`status=online`) antes de instalar.
+
+---
+
 ## Source Reference
 
 | File | Purpose |

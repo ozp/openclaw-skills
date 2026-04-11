@@ -37,13 +37,13 @@ Read the target SKILL.md file and extract YAML frontmatter.
 
 Apply all Free tier checks in order:
 
-| Category | Checks | What it catches |
-|----------|--------|----------------|
-| Structure (1.x) | Name format, description WHAT+WHEN, allowed-tools, categories, XML injection | Malformed frontmatter, missing fields |
-| Body (2.x) | Line count, hardcoded paths, stale dates, empty sections, deprecated syntax, MCP tool qualification | Content quality issues |
-| Naming (3.x) | Vague terms, single-word names, gerund suggestions | Poor discoverability |
-| Semantic (4.x) | Contradictions, ambiguous terms, missing output format, wisdom/platitudes, misplaced triggers | Logical inconsistencies |
-| Quality (8.x) | Examples, error handling, triggers, output format, prerequisites, negative triggers | Strengths (positive patterns) |
+| Category        | Checks                                                                                              | What it catches                       |
+| --------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| Structure (1.x) | Name format, description WHAT+WHEN, allowed-tools, categories, XML injection                        | Malformed frontmatter, missing fields |
+| Body (2.x)      | Line count, hardcoded paths, stale dates, empty sections, deprecated syntax, MCP tool qualification | Content quality issues                |
+| Naming (3.x)    | Vague terms, single-word names, gerund suggestions                                                  | Poor discoverability                  |
+| Semantic (4.x)  | Contradictions, ambiguous terms, missing output format, wisdom/platitudes, misplaced triggers       | Logical inconsistencies               |
+| Quality (8.x)   | Examples, error handling, triggers, output format, prerequisites, negative triggers                 | Strengths (positive patterns)         |
 
 ### Step 3: Score
 
