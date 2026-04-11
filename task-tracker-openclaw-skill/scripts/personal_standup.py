@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""
+Personal Daily Standup Generator - Creates a concise summary of personal priorities.
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import timedelta
+from pathlib import Path
+
+# Add parent directory to path for utils import
+sys.path.insert(0, str(Path(__file__).parent))
+from daily_notes import extract_completed_tasks
+from standup_common import (
+    flatten_calendar_events,
+    format_missed_tasks_block,
+    format_time,
+    get_calendar_events,
+    resolve_standup_date,
+)
+from utils import (
+    load_tasks,
+    get_missed_tasks_bucketed,
+    regroup_by_effective_priority,
+    escalation_suffix,
+    recurrence_suffix,
+    parse_duration,
+    format_duration,
+    dependency_suffix,
+    sprint_suffix,
+)
+
+
+def format_personal_standup(output: dict, date_display: str) -> str:
+    """Format personal standup as markdown."""
+    lines = [f"🏠 **Personal Daily Standup — {date_display}**\n"]
+    
+    # Calendar events
+    all_events = flatten_calendar_events(output['calendar'])
+    if all_events:
+        lines.append("📅 **Today's Calendar:**")
+        for event in all_events:
+            time_str = format_time(event['start'])
+            lines.append(f"  • {time_str} — {event['summary']}")
+        lines.append("")
+    
+    # #1 Priority
+    if output['priority']:
+        priority = output['priority']
+        rec = recurrence_suffix(priority)
+        est = f" ({priority['estimate']})" if priority.get('estimate') else ""
+        lines.append(f"🎯 **#1 Priority:** {priority['title']}{rec}{est}")
+        lines.append("")
+    
+    # Due Today
+    if output['due_today']:
+        total_est = sum(parse_duration(t.get('estimate')) for t in output['due_today'])
+        est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
+        lines.append(f"⏰ **Due Today:{est_str}**")
+        for t in output['due_today']:
+            rec = recurrence_suffix(t)
+            est = f" ({t['estimate']})" if t.get('estimate') else ""
+            lines.append(f"  • {t['title']}{rec}{est}")
+        lines.append("")
+    
+    # Q1 Must Do
+    if output['q1']:
+        total_est = sum(parse_duration(t.get('estimate')) for t in output['q1'])
+        est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
+        lines.append(f"🔴 **Must Do Today:{est_str}**")
+        for t in output['q1']:
+            esc = escalation_suffix(t)
+            rec = recurrence_suffix(t)
+            est = f" ({t['estimate']})" if t.get('estimate') else ""
+            dep = dependency_suffix(t)
+            spr = sprint_suffix(t)
+            lines.append(f"  • {t['title']}{esc}{rec}{est}{dep}{spr}")
+        lines.append("")
+    
+    # Q2 Should Do
+    if output['q2']:
+        total_est = sum(parse_duration(t.get('estimate')) for t in output['q2'])
+        est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
+        lines.append(f"🟡 **Should Do This Week:{est_str}**")
+        for t in output['q2']:
+            due_str = f" (🗓️{t['due']})" if t.get('due') else ""
+            rec = recurrence_suffix(t)
+            est = f" ({t['estimate']})" if t.get('estimate') else ""
+            dep = dependency_suffix(t)
+            spr = sprint_suffix(t)
+            lines.append(f"  • {t['title']}{due_str}{rec}{est}{dep}{spr}")
+        lines.append("")
+    
+    # Q3 Waiting On
+    if output['q3']:
+        lines.append("🟠 **Waiting On:**")
+        for t in output['q3']:
+            esc = escalation_suffix(t)
+            rec = recurrence_suffix(t)
+            dep = dependency_suffix(t)
+            lines.append(f"  • {t['title']}{esc}{rec}{dep}")
+        lines.append("")
+    
+    # Completed
+    if output['completed']:
+        lines.append(f"✅ **Completed:** ({len(output['completed'])} items)")
+        for t in output['completed'][:5]:  # Limit to 5
+            rec = recurrence_suffix(t)
+            lines.append(f"  • {t['title']}{rec}")
+        if len(output['completed']) > 5:
+            lines.append(f"  • ... and {len(output['completed']) - 5} more")
+    
+    return '\n'.join(lines)
+
+
+def generate_personal_standup(
+    date_str: str = None,
+    json_output: bool = False,
+    tasks_data: dict | None = None,
+    notes_dir: Path | None = None,
+) -> str | dict:
+    """Generate personal daily standup summary."""
+    if tasks_data is None:
+        _, tasks_data = load_tasks(personal=True)
+
+    standup_date = resolve_standup_date(date_str)
+    date_display = standup_date.strftime("%A, %B %d")
+
+    # Apply display-only priority escalation
+    regrouped = regroup_by_effective_priority(tasks_data, reference_date=standup_date)
+
+    # Completed: daily notes only (no all-time board fallback)
+    yesterday = standup_date - timedelta(days=1)
+    if notes_dir:
+        completed = extract_completed_tasks(
+            notes_dir=notes_dir,
+            start_date=yesterday,
+            end_date=standup_date,
+        )
+    else:
+        completed = []
+
+    # Build output using new task structure
+    output = {
+        'date': str(standup_date),
+        'date_display': date_display,
+        'calendar': get_calendar_events(),
+        'priority': None,
+        'due_today': tasks_data['due_today'],
+        'q1': regrouped['q1'],
+        'q2': regrouped['q2'],
+        'q3': regrouped['q3'],
+        'completed': completed,
+    }
+
+    # #1 Priority: first Q1 item, or first Q2 if no Q1
+    if regrouped['q1']:
+        output['priority'] = regrouped['q1'][0]
+    elif regrouped['q2']:
+        output['priority'] = regrouped['q2'][0]
+
+    if json_output:
+        return output
+
+    return format_personal_standup(output, date_display)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Generate personal daily standup')
+    parser.add_argument('--date', help='Date for standup (YYYY-MM-DD)')
+    parser.add_argument('--json', action='store_true', help='Output as JSON')
+    parser.add_argument('--skip-missed', action='store_true', help='Skip missed tasks section')
+
+    args = parser.parse_args()
+
+    _, tasks_data = load_tasks(personal=True)
+    missed_buckets = None
+    if not args.skip_missed:
+        missed_buckets = get_missed_tasks_bucketed(tasks_data, reference_date=args.date)
+
+    notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+    notes_dir = Path(notes_dir_raw) if notes_dir_raw else None
+
+    result = generate_personal_standup(
+        date_str=args.date,
+        json_output=args.json,
+        tasks_data=tasks_data,
+        notes_dir=notes_dir,
+    )
+
+    missed_block = ""
+    if not args.json:
+        missed_block = format_missed_tasks_block(missed_buckets)
+        if missed_block:
+            result = f"{missed_block}{result}"
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        print(result)
+
+
+if __name__ == '__main__':
+    main()
