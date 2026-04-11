@@ -137,22 +137,27 @@ Provide a few scenario prompts to test the result, for example:
 
 Before designing a new agent from scratch, consult the **awesome-openclaw-agents** library for ready-made SOUL.md templates:
 
-- **162 templates** across 19 categories: automation, business, creative, data, development, devops, education, finance, hr, marketing, productivity, security, and more.
-- Each entry has a named identity (e.g., Lens for code review, Beats for music, Clipper for short-form video) and a structured SOUL.md.
-- Use as inspiration for naming, role definition, responsibilities, Do/Don't rules, and output formats.
+- **199 templates** across 25 categorias: automation, business, creative, data, development, devops, education, finance, hr, marketing, productivity, security, e mais.
+- Cada entry tem identidade nomeada (Lens para code review, Beats para música, Clipper para vídeo) e SOUL.md estruturado.
+- Usar como inspiração para naming, definição de role, responsabilidades, regras Do/Don't e formatos de output.
 
+**Mirror local disponível** (preferencial — sem rede):
 ```bash
-# Buscar templates de uma categoria antes de criar um agente
-gh api repos/mergisi/awesome-openclaw-agents/contents/agents.json \
-  --jq '.content' | base64 -d | \
-  jq -r '.[] | select(.category=="development") | "\(.id) — \(.name): \(.role)"'
+MIRROR=/home/ozp/code/mirror/awesome-openclaw-agents
 
-# Ler o SOUL.md de um template específico
-gh api 'repos/mergisi/awesome-openclaw-agents/contents/agents/development/code-reviewer/SOUL.md' \
-  --jq '.content' | base64 -d
+# Buscar por categoria
+jq -r '.agents[] | select(.category=="development") | "\(.id) — \(.name): \(.role)"' $MIRROR/agents.json
+
+# Ler SOUL.md de um template
+cat $MIRROR/agents/development/code-reviewer/SOUL.md
+
+# Busca por palavra-chave
+jq -r '.agents[] | select((.name+.role)|ascii_downcase|contains("review")) | "\(.category)/\(.id)"' $MIRROR/agents.json
 ```
 
-For the full catalog (19 categories, fetch commands, usage patterns), see:
+**Nota:** `agents.json` tem estrutura `{ "total": 199, "agents": [...] }` — usar `.agents[]`, não `.[]`.
+
+For the full catalog (25 categories, all commands, usage patterns), see:
 
 - [`references/awesome-openclaw-agents.md`](references/awesome-openclaw-agents.md)
 
