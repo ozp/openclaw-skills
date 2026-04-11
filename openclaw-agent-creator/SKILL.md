@@ -133,6 +133,29 @@ Provide a few scenario prompts to test the result, for example:
 - decide whether to ask for confirmation before an external or destructive action;
 - confirm that `agents_list` returns the new agent from any agent that should be able to spawn it.
 
+## Community Agent Library
+
+Before designing a new agent from scratch, consult the **awesome-openclaw-agents** library for ready-made SOUL.md templates:
+
+- **162 templates** across 19 categories: automation, business, creative, data, development, devops, education, finance, hr, marketing, productivity, security, and more.
+- Each entry has a named identity (e.g., Lens for code review, Beats for music, Clipper for short-form video) and a structured SOUL.md.
+- Use as inspiration for naming, role definition, responsibilities, Do/Don't rules, and output formats.
+
+```bash
+# Buscar templates de uma categoria antes de criar um agente
+gh api repos/mergisi/awesome-openclaw-agents/contents/agents.json \
+  --jq '.content' | base64 -d | \
+  jq -r '.[] | select(.category=="development") | "\(.id) — \(.name): \(.role)"'
+
+# Ler o SOUL.md de um template específico
+gh api 'repos/mergisi/awesome-openclaw-agents/contents/agents/development/code-reviewer/SOUL.md' \
+  --jq '.content' | base64 -d
+```
+
+For the full catalog (19 categories, fetch commands, usage patterns), see:
+
+- [`references/awesome-openclaw-agents.md`](references/awesome-openclaw-agents.md)
+
 ## How to adapt a template or concept
 
 When the user provides a document, prompt, or third-party agent template:
@@ -172,3 +195,5 @@ Escalate before proceeding when the choice changes security, cost, or routing be
 ## References
 
 Read `references/agent-creation.md` when you need verified command/file details, workspace mapping, and token implications.
+
+Read `references/awesome-openclaw-agents.md` for the community template library (162 agent SOUL.md templates across 19 categories) — consult before creating any new agent.
