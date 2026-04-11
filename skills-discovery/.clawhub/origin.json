@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "registry": "https://claude-plugins.dev",
+  "slug": "skills-discovery",
+  "source": "github/Kamalnrf/claude-plugins/skills-discovery",
+  "installedAt": 1744076100000
+}
