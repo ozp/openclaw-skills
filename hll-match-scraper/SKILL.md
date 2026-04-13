@@ -86,6 +86,36 @@ python3 ~/clawd/skills/hll-match-scraper/scripts/hll_scraper.py --list --base-ur
 python3 ~/clawd/skills/hll-match-scraper/scripts/hll_scraper.py --live --base-url "http://95.111.238.42:7012"
 ```
 
+## CSV Exports (`--csv`)
+
+When `--csv` is passed, the script generates 6 focused CSV files:
+
+| File | Rows | Description |
+|------|------|-------------|
+| `hll_match_{ID}_overview.csv` | 1 | Match summary: map, score, duration, totals |
+| `hll_match_{ID}_teams.csv` | 2 | Team-level: kills, deaths, avg K/D, scores |
+| `hll_match_{ID}_classes.csv` | ~9 | Kills by type per team (infantry, MG, armor, sniper, etc.) |
+| `hll_match_{ID}_scoreboard.csv` | 75 | Full player stats with kills/deaths by type columns |
+| `hll_match_{ID}_weapons.csv` | ~200 | Player + weapon + kills (granular weapon breakdown) |
+| `hll_match_{ID}_nemeses.csv` | 75 | Each player's most killed victim and most frequent killer |
+
+### Scoreboard CSV columns (34 total)
+
+`player`, `player_id`, `team`, `level`, `kills`, `deaths`, `kd`, `kpm`,
+`kills_streak`, `time_min`, `combat`, `offense`, `defense`, `support`,
+`teamkills`, `deaths_by_tk`, `kills_infantry`, `kills_machine_gun`,
+`kills_armor`, `kills_sniper`, `kills_commander`, `kills_grenade`,
+`kills_bazooka`, `kills_self_propelled_artillery`, `kills_pak`,
+`deaths_infantry`, `deaths_machine_gun`, `deaths_armor`, `deaths_sniper`,
+`deaths_commander`, `deaths_grenade`, `deaths_bazooka`,
+`deaths_self_propelled_artillery`, `deaths_pak`
+
+### Classes CSV — maps to charts page categories
+
+The `kill_type` column maps to the "Kills by type" chart on the `/charts` page:
+`infantry`, `machine_gun`, `armor`, `sniper`, `commander`, `grenade`,
+`bazooka`, `self_propelled_artillery`, `pak`
+
 ## Step 3: Present Results
 
 Present the data to the user in a clear format:

@@ -202,21 +202,135 @@ def print_live_stats(data: dict):
     print(f"{'='*50}")
 
 
-def export_csv(players: list, filepath: Path):
-    """Export player stats as CSV."""
-    fields = [
-        "player", "team_side", "level", "kills", "deaths", "kill_death_ratio",
-        "kills_per_minute", "kills_streak", "time_seconds", "combat", "offense",
-        "defense", "support", "teamkills", "deaths_by_tk"
-    ]
-    with open(filepath, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        for p in players:
-            row = {k: p.get(k, "") for k in fields}
-            row["team_side"] = p.get("team", {}).get("side", "?")
-            writer.writerow(row)
-    print(f"CSV salvo: {filepath}")
+def export_all_csv(data: dict, out_dir: Path, game_id: int):
+    """Export 6 focused CSVs from match data."""
+    g = data["result"]
+    players = g.get("player_stats", [])
+    allies = [p for p in players if p.get("team", {}).get("side") == "allies"]
+    axis = [p for p in players if p.get("team", {}).get("side") == "axis"]
+    prefix = f"hll_match_{game_id}"
+
+    # --- 1. overview.csv (1 row = the match) ---
+    try:
+        s = datetime.fromisoformat(g["start"].replace("+00:00", ""))
+        e = datetime.fromisoformat(g["end"].replace("+00:00", ""))
+        dur = round((e - s).total_seconds() / 60)
+    except Exception:
+        dur = 0
+
+    ak = sum(p["kills"] for p in allies)
+    xk = sum(p["kills"] for p in axis)
+    ad = sum(p["deaths"] for p in allies)
+    xd = sum(p["deaths"] for p in axis)
+    atk = sum(p["teamkills"] for p in allies)
+    xtk = sum(p["teamkills"] for p in axis)
+
+    fp = out_dir / f"{prefix}_overview.csv"
+    with open(fp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["game_id", "map", "mode", "start", "end", "duration_min",
+                     "server", "allied_score", "axis_score", "total_players",
+                     "allies_count", "axis_count", "allied_kills", "axis_kills",
+                     "allied_deaths", "axis_deaths", "allied_tk", "axis_tk"])
+        w.writerow([g["id"], g["map_name"], g.get("map", {}).get("game_mode", ""),
+                     g["start"], g["end"], dur, g["server_number"],
+                     g["result"]["allied"], g["result"]["axis"],
+                     len(players), len(allies), len(axis),
+                     ak, xk, ad, xd, atk, xtk])
+    print(f"  {fp.name}")
+
+    # --- 2. scoreboard.csv (1 row = 1 player, with kills/deaths by type) ---
+    kill_types = sorted(set(kt for p in players for kt in p.get("kills_by_type", {})))
+    death_types = sorted(set(dt for p in players for dt in p.get("deaths_by_type", {})))
+    fields = ["player", "player_id", "team", "level", "kills", "deaths", "kd", "kpm",
+              "kills_streak", "time_min", "combat", "offense", "defense", "support",
+              "teamkills", "deaths_by_tk"]
+    fields += [f"kills_{t}" for t in kill_types]
+    fields += [f"deaths_{t}" for t in death_types]
+
+    fp = out_dir / f"{prefix}_scoreboard.csv"
+    with open(fp, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for p in sorted(players, key=lambda x: x["kills"], reverse=True):
+            row = {
+                "player": p["player"], "player_id": p["player_id"],
+                "team": p.get("team", {}).get("side", "?"),
+                "level": p.get("level", ""), "kills": p["kills"],
+                "deaths": p["deaths"], "kd": round(p["kill_death_ratio"], 2),
+                "kpm": round(p["kills_per_minute"], 2),
+                "kills_streak": p["kills_streak"],
+                "time_min": round(p["time_seconds"] / 60),
+                "combat": p["combat"], "offense": p["offense"],
+                "defense": p["defense"], "support": p["support"],
+                "teamkills": p["teamkills"], "deaths_by_tk": p["deaths_by_tk"],
+            }
+            for t in kill_types:
+                row[f"kills_{t}"] = p.get("kills_by_type", {}).get(t, 0)
+            for t in death_types:
+                row[f"deaths_{t}"] = p.get("deaths_by_type", {}).get(t, 0)
+            w.writerow(row)
+    print(f"  {fp.name}")
+
+    # --- 3. weapons.csv (1 row = 1 player + 1 weapon) ---
+    fp = out_dir / f"{prefix}_weapons.csv"
+    with open(fp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["player", "team", "weapon", "kills"])
+        for p in sorted(players, key=lambda x: x["kills"], reverse=True):
+            for weapon, kills in sorted(p.get("weapons", {}).items(), key=lambda x: -x[1]):
+                w.writerow([p["player"], p.get("team", {}).get("side", "?"), weapon, kills])
+    print(f"  {fp.name}")
+
+    # --- 4. teams.csv (1 row = 1 team) ---
+    fp = out_dir / f"{prefix}_teams.csv"
+    with open(fp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["team", "players", "kills", "deaths", "avg_kd", "teamkills",
+                     "combat", "offense", "defense", "support"])
+        for side, group in [("allies", allies), ("axis", axis)]:
+            if not group:
+                continue
+            w.writerow([side, len(group),
+                        sum(p["kills"] for p in group),
+                        sum(p["deaths"] for p in group),
+                        round(sum(p["kill_death_ratio"] for p in group) / len(group), 2),
+                        sum(p["teamkills"] for p in group),
+                        sum(p["combat"] for p in group),
+                        sum(p["offense"] for p in group),
+                        sum(p["defense"] for p in group),
+                        sum(p["support"] for p in group)])
+    print(f"  {fp.name}")
+
+    # --- 5. classes.csv (kills by type per team — "classes" from charts page) ---
+    all_types = sorted(
+        set(kt for p in players for kt in p.get("kills_by_type", {})),
+        key=lambda t: -sum(p.get("kills_by_type", {}).get(t, 0) for p in players)
+    )
+    fp = out_dir / f"{prefix}_classes.csv"
+    with open(fp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["kill_type", "allies_kills", "axis_kills", "total"])
+        for t in all_types:
+            ak_t = sum(p.get("kills_by_type", {}).get(t, 0) for p in allies)
+            xk_t = sum(p.get("kills_by_type", {}).get(t, 0) for p in axis)
+            w.writerow([t, ak_t, xk_t, ak_t + xk_t])
+    print(f"  {fp.name}")
+
+    # --- 6. nemeses.csv (who each player kills most / dies to most) ---
+    fp = out_dir / f"{prefix}_nemeses.csv"
+    with open(fp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["player", "team", "killed_most", "times", "killed_by_most", "times_by"])
+        for p in sorted(players, key=lambda x: x["kills"], reverse=True):
+            mk = p.get("most_killed", {})
+            db = p.get("death_by", {})
+            top_killed = max(mk.items(), key=lambda x: x[1]) if mk else ("", 0)
+            top_death = max(db.items(), key=lambda x: x[1]) if db else ("", 0)
+            w.writerow([p["player"], p.get("team", {}).get("side", "?"),
+                        top_killed[0], top_killed[1],
+                        top_death[0], top_death[1]])
+    print(f"  {fp.name}")
 
 
 def main():
@@ -282,9 +396,8 @@ def main():
                 print(f"JSON salvo: {fpath}")
 
             if args.csv:
-                players = data.get("result", {}).get("player_stats", [])
-                fpath = out_dir / f"hll_game_{game_id}.csv"
-                export_csv(players, fpath)
+                print(f"\nExportando CSVs para {out_dir}/:")
+                export_all_csv(data, out_dir, game_id)
 
         else:
             print("Erro: Não foi possível detectar o game ID da URL.")
