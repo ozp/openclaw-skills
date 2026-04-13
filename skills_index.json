@@ -152,5 +152,12 @@
     "description": "Personal task management with daily standups and weekly reviews",
     "category": "productivity",
     "risk": "low"
+  },
+  {
+    "path": "hll-match-scraper",
+    "name": "HLL Match Scraper",
+    "description": "Extract full match data from Hell Let Loose (HLL) servers via CRCON API. Given a game URL, fetches complete scoreboard, kills by type, weapons, nemeses, team stats.",
+    "category": "data-extraction",
+    "risk": "low"
   }
 ]

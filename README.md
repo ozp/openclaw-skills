@@ -32,6 +32,7 @@ curl -fsS -X POST "$BASE/api/v1/skills/marketplace/$SKILL_ID/install?gateway_id=
 
 | Skill | Category | Risk | Description |
 |---|---|---|---|
+<<<<<<< HEAD
 | [antv-infographic](./antv-infographic/) | visualization | low | Create data visualizations and infographics using AntV |
 | [code-reviewer](./code-reviewer/) | development | low | Review code for quality, best practices, and potential issues |
 | [doc-generator](./doc-generator/) | documentation | low | Generate documentation from code and comments |
@@ -54,6 +55,7 @@ curl -fsS -X POST "$BASE/api/v1/skills/marketplace/$SKILL_ID/install?gateway_id=
 | [task-decomposer](./task-decomposer/) | productivity | low | Break down complex tasks into manageable steps |
 | [taskmaster-setup](./taskmaster-setup/) | infrastructure | low | Configure TaskMaster AI with LiteLLM proxy |
 | [task-tracker-openclaw-skill](./task-tracker-openclaw-skill/) | productivity | low | Personal task management with daily standups and weekly reviews |
+| [hll-match-scraper](./hll-match-scraper/) | data-extraction | low | Extract HLL match data via CRCON API (scoreboard, kills, weapons) |
 
 ## Adding Skills to this Repository
 
