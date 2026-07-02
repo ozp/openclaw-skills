@@ -3,7 +3,7 @@
 Task Tracker CLI - Supports both Work and Personal tasks.
 
 Usage:
-    tasks.py list [--priority high|medium|low] [--status open|done] [--completed-since 24h|7d|30d] [--due today|this-week|overdue|due-or-overdue]
+    tasks.py list [--priority high|medium|low] [--status open|done] [--completed-since 24h|7d|30d] [--due today|this-week|overdue|due-or-overdue] [--plain]
     tasks.py --personal list
     tasks.py add "Task title" [--priority high|medium|low] [--due YYYY-MM-DD]
     tasks.py done "task query"
@@ -73,6 +73,64 @@ def list_tasks(args):
     if args.due:
         filtered = [t for t in filtered if check_due_date(t.get('due', ''), args.due)]
 
+    if getattr(args, 'area', None):
+        area_query = args.area.lower()
+        filtered = [
+            t for t in filtered
+            if t.get('area') and area_query in t.get('area', '').lower()
+        ]
+
+    if getattr(args, 'search', None):
+        search_query = args.search.lower()
+        # Load content for full-text search through notes
+        tasks_file, fmt = get_tasks_file(args.personal)
+        if tasks_file.exists():
+            file_content = tasks_file.read_text()
+        else:
+            file_content = ''
+        search_results = []
+        for t in filtered:
+            if search_query in t.get('title', '').lower():
+                search_results.append(t)
+                continue
+            # Check raw_line and continuation notes
+            raw = t.get('raw_line', '').lower()
+            if search_query in raw:
+                search_results.append(t)
+                continue
+            # Extract task block from file content for full note search
+            rl = t.get('raw_line', '')
+            if rl and file_content:
+                lines = file_content.split('\n')
+                try:
+                    start_idx = lines.index(rl)
+                except ValueError:
+                    start_idx = -1
+                if start_idx >= 0:
+                    target_indent = len(rl) - len(rl.lstrip(' '))
+                    j = start_idx + 1
+                    while j < len(lines):
+                        line = lines[j]
+                        if line.strip() == '':
+                            k = j + 1
+                            while k < len(lines) and lines[k].strip() == '':
+                                k += 1
+                            if k < len(lines):
+                                ni = len(lines[k]) - len(lines[k].lstrip(' '))
+                                if ni > target_indent:
+                                    j += 1
+                                    continue
+                            break
+                        ni = len(line) - len(line.lstrip(' '))
+                        if ni > target_indent:
+                            if search_query in line.lower():
+                                search_results.append(t)
+                                break
+                            j += 1
+                            continue
+                        break
+        filtered = search_results
+
     if args.completed_since:
         # Note: timestamps are date-only (YYYY-MM-DD), so "24h" actually
         # means "yesterday or today" and "7d" means "last 7 calendar days".
@@ -117,21 +175,68 @@ def list_tasks(args):
         task_type = "Personal" if args.personal else "Work"
         print(f"No {task_type} tasks found matching criteria.")
         return
-    
-    print(f"\n📋 {('Personal' if args.personal else 'Work')} Tasks ({len(filtered)} items)\n")
-    
-    current_section = None
+
+    use_table = not getattr(args, 'plain', False)
+    task_type = "Personal" if args.personal else "Work"
+    print(f"📋 {task_type} Tasks ({len(filtered)} items)\n")
+
+    # Section display config: section_key -> (emoji_header, icon_order)
+    section_config = [
+        ('q1', '🔴 High Priority'),
+        ('q2', '🟡 Medium Priority'),
+        ('q3', '🟠 Waiting / Delegated'),
+        ('parking_lot', '🅿️ Parking Lot'),
+        ('backlog', '⚪ Backlog'),
+        ('done', '✅ Done'),
+        ('today', '📌 Today'),
+        ('objectives', '🎯 Objectives'),
+        ('team', '👥 Team'),
+    ]
+    section_order = {s[0]: i for i, s in enumerate(section_config)}
+    section_headers = {s[0]: s[1] for s in section_config}
+
+    # Group tasks by section, preserving order
+    grouped: dict[str, list] = {}
     for task in filtered:
-        section = task.get('section')
-        if section != current_section:
-            current_section = section
-            print(f"### {get_section_display_name(section, args.personal)}\n")
-        
-        checkbox = '✅' if task['done'] else '⬜'
-        due_str = f" (🗓️{task['due']})" if task.get('due') else ''
-        area_str = f" [{task.get('area')}]" if task.get('area') else ''
-        
-        print(f"{checkbox} **{task['title']}**{due_str}{area_str}")
+        sec = task.get('section') or 'uncategorized'
+        grouped.setdefault(sec, []).append(task)
+
+    # Sort sections by defined order, unknown sections last
+    sorted_sections = sorted(grouped.keys(), key=lambda s: section_order.get(s, 99))
+
+    global_counter = 0
+
+    for sec in sorted_sections:
+        tasks_in_section = grouped[sec]
+        header = section_headers.get(sec, get_section_display_name(sec, args.personal))
+
+        if use_table:
+            print(f"## {header}\n")
+            print("| # | Status | Task | Área | Due |")
+            print("|---|--------|------|------|-----|")
+
+        for task in tasks_in_section:
+            global_counter += 1
+            checkbox = '✅' if task['done'] else '⬜'
+            title = task['title']
+            # Truncate very long titles for table readability
+            if use_table and len(title) > 80:
+                title = title[:77] + '...'
+            # Escape pipe characters in title for markdown tables
+            title = title.replace('|', '\\|')
+            area = task.get('area') or '—'
+            area = area.replace('|', '\\|')
+            due = task.get('due', '—') or '—'
+
+            if use_table:
+                print(f"| {global_counter} | {checkbox} | {title} | {area} | {due} |")
+            else:
+                due_str = f" (🗓️{task['due']})" if task.get('due') else ''
+                area_str = f" [{task.get('area')}]" if task.get('area') else ''
+                print(f"{checkbox} **{title}**{due_str}{area_str}")
+
+        if use_table:
+            print()
 
 
 def add_task(args):
@@ -1409,6 +1514,254 @@ def _format_completion_pct(value: float) -> str:
     return f"{value:.1f}"
 
 
+def _get_full_task_block(content: str, raw_line: str) -> list[str]:
+    """Extract a task line and all its continuation/note lines."""
+    lines = content.split('\n')
+    try:
+        start = lines.index(raw_line)
+    except ValueError:
+        return [raw_line]
+
+    block = [raw_line]
+    target_indent = len(raw_line) - len(raw_line.lstrip(' '))
+    i = start + 1
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() == '':
+            # Peek ahead: if next non-blank line is continuation, include blanks
+            j = i + 1
+            while j < len(lines) and lines[j].strip() == '':
+                j += 1
+            if j < len(lines):
+                next_indent = len(lines[j]) - len(lines[j].lstrip(' '))
+                if next_indent > target_indent:
+                    block.append(line)
+                    i += 1
+                    continue
+            break
+        indent = len(line) - len(line.lstrip(' '))
+        if indent > target_indent:
+            block.append(line)
+            i += 1
+            continue
+        break
+    return block
+
+
+def _find_task_and_file(personal: bool, query: str):
+    """Find a single open task by fuzzy title match. Returns (tasks_file, task, content, error_msg)."""
+    tasks_file, fmt = get_tasks_file(personal)
+    if not tasks_file.exists():
+        return tasks_file, None, '', f"❌ Tasks file not found: {tasks_file}"
+    content = tasks_file.read_text()
+    tasks_data = parse_tasks(content, personal, fmt)
+    matches = [t for t in tasks_data.get('all', [])
+               if not t.get('done') and query.lower() in t.get('title', '').lower()]
+    if not matches:
+        return tasks_file, None, content, f"❌ No open task matches: {query}"
+    if len(matches) > 1:
+        titles = '\n'.join(f'  {i}. {t["title"]}' for i, t in enumerate(matches, 1))
+        return tasks_file, None, content, f"❌ Multiple matches:\n{titles}\nBe more specific."
+    return tasks_file, matches[0], content, ''
+
+
+# Section mapping for move command
+SECTION_MAP = {
+    'high': '## 🔴 High Priority (This Week)',
+    'medium': '## 🟡 Medium Priority (This Week)',
+    'waiting': '## 🟠 Waiting / Delegated',
+    'parking-lot': '## 🅿️ Parking Lot',
+    'backlog': '## ⚪ Backlog',
+}
+
+
+def cmd_move(args):
+    """Move a task between priority sections."""
+    tasks_file, task, content, err = _find_task_and_file(args.personal, args.query)
+    if err:
+        print(err)
+        return
+
+    old_line = task.get('raw_line', '')
+    if not old_line:
+        print("❌ Task has no raw line; cannot move.")
+        return
+
+    target_section = SECTION_MAP[args.to]
+    # Check target section exists in file
+    if target_section not in content:
+        print(f"❌ Target section '{target_section}' not found in tasks file.")
+        return
+
+    # Extract full task block (line + continuation notes)
+    block = _get_full_task_block(content, old_line)
+    block_text = '\n'.join(block)
+
+    # Remove the task block from current position
+    new_content = _remove_task_line(content, old_line)
+    # _remove_task_line already handles continuation lines, but let's be safe
+    # and ensure all block lines are gone
+    for line in block[1:]:
+        if line in new_content:
+            # Remove the line
+            new_content = new_content.replace(line, '', 1)
+    # Clean up double blank lines
+    new_content = re.sub(r'\n{3,}', '\n\n', new_content)
+
+    # Insert after target section header
+    lines = new_content.split('\n')
+    inserted = False
+    for i, line in enumerate(lines):
+        if line.strip() == target_section.strip():
+            # Skip blank lines after header
+            insert_at = i + 1
+            while insert_at < len(lines) and lines[insert_at].strip() == '':
+                insert_at += 1
+            # Insert block lines in reverse at insert_at
+            for bline in reversed(block):
+                lines.insert(insert_at, bline)
+            inserted = True
+            break
+
+    if not inserted:
+        print(f"❌ Could not find insertion point for section '{target_section}'.")
+        return
+
+    tasks_file.write_text('\n'.join(lines))
+    print(f"✅ Moved '{task['title']}' → {args.to}")
+
+
+def cmd_edit(args):
+    """Edit properties of an existing task."""
+    tasks_file, task, content, err = _find_task_and_file(args.personal, args.query)
+    if err:
+        print(err)
+        return
+
+    old_line = task.get('raw_line', '')
+    if not old_line:
+        print("❌ Task has no raw line; cannot edit.")
+        return
+
+    new_line = old_line
+
+    # --title: rename
+    if args.title:
+        old_title = task['title']
+        new_line = new_line.replace(f'**{old_title}**', f'**{args.title}**', 1)
+
+    # --area: replace area tag
+    if args.area:
+        if 'area::' in new_line:
+            new_line = re.sub(r'area::\s*[^\s]+', f'area:: {args.area}', new_line, count=1)
+        else:
+            new_line = f"{new_line.rstrip()} area:: {args.area}"
+
+    # --due: set/update due date
+    if args.due:
+        if '🗓️' in new_line:
+            new_line = re.sub(r'🗓️\d{4}-\d{2}-\d{2}', f'🗓️{args.due}', new_line, count=1)
+        else:
+            # Insert before inline fields or at end
+            inline_field_match = re.search(r'\s+\w+::', new_line)
+            if inline_field_match:
+                pos = inline_field_match.start()
+                new_line = f"{new_line[:pos]} 🗓️{args.due}{new_line[pos:]}"
+            else:
+                new_line = f"{new_line.rstrip()} 🗓️{args.due}"
+
+    # --note: replace note block (indented lines after task line)
+    if args.note:
+        content = content.replace(old_line, new_line, 1)
+        # Remove old note/continuation lines
+        new_content = _remove_task_line(content, new_line)
+        # Re-add just the task line + new note
+        lines = new_content.split('\n')
+        try:
+            idx = lines.index(new_line)
+        except ValueError:
+            # Line was removed by _remove_task_line, re-insert it
+            # Find section and reinsert
+            lines.append(new_line)  # fallback
+            idx = len(lines) - 1
+        for note_line in reversed(args.note.split('\n')):
+            lines.insert(idx + 1, f'  → {note_line}' if not note_line.startswith('  ') else note_line)
+        tasks_file.write_text('\n'.join(lines))
+        print(f"✅ Edited '{task['title']}' (note replaced)")
+        return
+
+    # --append-note: add line to existing notes
+    if args.append_note:
+        content = content.replace(old_line, new_line, 1)
+        block = _get_full_task_block(content, new_line)
+        lines = content.split('\n')
+        # Find the last line of the block
+        last_block_line = block[-1]
+        try:
+            insert_idx = lines.index(last_block_line) + 1
+        except ValueError:
+            insert_idx = lines.index(new_line) + 1
+        note_text = args.append_note
+        note_line = f'  → {note_text}' if not note_text.startswith('  ') else note_text
+        lines.insert(insert_idx, note_line)
+        tasks_file.write_text('\n'.join(lines))
+        print(f"✅ Edited '{task['title']}' (note appended)")
+        return
+
+    # If only inline edits (title, area, due), just replace the line
+    if new_line != old_line:
+        content = content.replace(old_line, new_line, 1)
+        tasks_file.write_text(content)
+        changes = []
+        if args.title:
+            changes.append(f'title→{args.title}')
+        if args.area:
+            changes.append(f'area→{args.area}')
+        if args.due:
+            changes.append(f'due→{args.due}')
+        print(f"✅ Edited '{task['title']}' ({', '.join(changes)})")
+    else:
+        print("⚠️ No changes specified.")
+
+
+def cmd_show(args):
+    """Show full details of a single task."""
+    tasks_file, task, content, err = _find_task_and_file(args.personal, args.query)
+    if err:
+        print(err)
+        return
+
+    # Extract full block including notes
+    raw_line = task.get('raw_line', '')
+    block = _get_full_task_block(content, raw_line) if raw_line else [raw_line]
+
+    # Display structured output
+    title = task.get('title', '(untitled)')
+    section = task.get('section', '—')
+    done = task.get('done', False)
+    area = task.get('area') or '—'
+    due = task.get('due') or '—'
+    owner = task.get('owner') or '—'
+
+    status = '✅ Done' if done else '⬜ Open'
+    print(f"📋 {title}")
+    print(f"   Status:   {status}")
+    print(f"   Section:  {section}")
+    print(f"   Area:     {area}")
+    print(f"   Due:      {due}")
+    print(f"   Owner:    {owner}")
+
+    # Show continuation lines (notes) from block
+    notes = block[1:]  # everything after the task line itself
+    if notes:
+        print(f"   Notes:")
+        for note in notes:
+            print(f"   {note}")
+
+    # Show raw line for debugging
+    print(f"\n   Raw: {raw_line}")
+
+
 def cmd_objectives(args):
     """Show objective-level completion status."""
     content, tasks_data = load_tasks(args.personal)
@@ -1458,6 +1811,9 @@ def main():
     list_parser.add_argument('--status', choices=['open', 'done'])
     list_parser.add_argument('--due', choices=['today', 'this-week', 'overdue', 'due-or-overdue'])
     list_parser.add_argument('--completed-since', choices=['24h', '7d', '30d'])
+    list_parser.add_argument('--area', help='Filter by area tag (partial match)')
+    list_parser.add_argument('--search', help='Full-text search across title and notes')
+    list_parser.add_argument('--plain', action='store_true', help='Plain text output (no markdown table)')
     list_parser.set_defaults(func=list_tasks)
     
     # Add command
@@ -1645,6 +2001,29 @@ def main():
     review_parser.add_argument('--stale-days', type=int, default=int(os.getenv('PARKING_LOT_STALE_DAYS', '30')))
     review_parser.add_argument('--json', action='store_true')
     review_parser.set_defaults(func=cmd_review_backlog)
+
+    # Move command
+    move_parser = subparsers.add_parser('move', help='Move task to a different priority section')
+    move_parser.add_argument('query', help='Task title (fuzzy match)')
+    move_parser.add_argument('--to', required=True,
+                             choices=['high', 'medium', 'waiting', 'parking-lot', 'backlog'],
+                             help='Target section')
+    move_parser.set_defaults(func=cmd_move)
+
+    # Edit command
+    edit_parser = subparsers.add_parser('edit', help='Edit properties of an existing task')
+    edit_parser.add_argument('query', help='Task title (fuzzy match)')
+    edit_parser.add_argument('--title', help='New task title')
+    edit_parser.add_argument('--area', help='Replace area tag')
+    edit_parser.add_argument('--due', help='Set/update due date (YYYY-MM-DD)')
+    edit_parser.add_argument('--note', help='Replace task note block')
+    edit_parser.add_argument('--append-note', help='Append a line to task notes')
+    edit_parser.set_defaults(func=cmd_edit)
+
+    # Show command
+    show_parser = subparsers.add_parser('show', help='Show full details of a single task')
+    show_parser.add_argument('query', help='Task title (fuzzy match)')
+    show_parser.set_defaults(func=cmd_show)
 
     args = parser.parse_args()
     args.func(args)

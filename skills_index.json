@@ -1,156 +1,178 @@
 [
   {
     "path": "antv-infographic",
-    "name": "AntV Infographic",
-    "description": "Create data visualizations and infographics using AntV",
-    "category": "visualization",
-    "risk": "low"
-  },
-  {
-    "path": "code-reviewer",
-    "name": "Code Reviewer",
-    "description": "Review code for quality, best practices, and potential issues",
-    "category": "development",
-    "risk": "low"
-  },
-  {
-    "path": "doc-generator",
-    "name": "Documentation Generator",
-    "description": "Generate documentation from code and comments",
-    "category": "documentation",
-    "risk": "low"
-  },
-  {
-    "path": "error-analyzer",
-    "name": "Error Analyzer",
-    "description": "Analyze errors and suggest fixes",
-    "category": "debugging",
-    "risk": "low"
-  },
-  {
-    "path": "litellm-cadastrador",
-    "name": "LiteLLM Model Registrar",
-    "description": "Register and manage LiteLLM model configurations",
-    "category": "infrastructure",
-    "risk": "low"
-  },
-  {
-    "path": "mc-operator",
-    "name": "MC Operator",
-    "description": "Operate Mission Control boards via REST API",
-    "category": "operations",
-    "risk": "low"
-  },
-  {
-    "path": "mineru",
-    "name": "MinerU Document Parser",
-    "description": "Parse PDF/Word/PPT/images to Markdown via MinerU API",
-    "category": "document-processing",
-    "risk": "low"
-  },
-  {
-    "path": "openclaw-agent-creator",
-    "name": "OpenClaw Agent Creator",
-    "description": "Create and bootstrap new OpenClaw agents and workspaces",
-    "category": "infrastructure",
-    "risk": "medium"
-  },
-  {
-    "path": "openclaw-audit",
-    "name": "OpenClaw Audit",
-    "description": "Audit OpenClaw installation for security and configuration",
-    "category": "security",
-    "risk": "low"
-  },
-  {
-    "path": "openclaw-model-config",
-    "name": "OpenClaw Model Config",
-    "description": "Generate and manage OpenClaw model/provider configurations",
-    "category": "configuration",
-    "risk": "safe"
-  },
-  {
-    "path": "openclaw-session-governance",
-    "name": "OpenClaw Session Governance",
-    "description": "Audit and govern OpenClaw session lifecycle",
-    "category": "infrastructure",
-    "risk": "low"
-  },
-  {
-    "path": "openclaw-update",
-    "name": "OpenClaw Update",
-    "description": "Update OpenClaw gateway and CLI to latest version",
-    "category": "maintenance",
-    "risk": "low"
-  },
-  {
-    "path": "prompt-improver",
-    "name": "Prompt Improver",
-    "description": "Improve prompts applying prompt engineering techniques",
-    "category": "productivity",
-    "risk": "low"
-  },
-  {
-    "path": "repo-ecosystem-evaluator",
-    "name": "Repository Ecosystem Evaluator",
-    "description": "Evaluate repositories for architecture quality and stack fit",
-    "category": "analysis",
-    "risk": "low"
-  },
-  {
-    "path": "serena-source-consultation",
-    "name": "Serena Source Consultation",
-    "description": "Consult source code to verify system behavior",
-    "category": "research",
-    "risk": "low"
-  },
-  {
-    "path": "skill-check",
-    "name": "SkillCheck",
-    "description": "Validate Claude Code skills against agentskills specification",
-    "category": "development",
-    "risk": "safe"
-  },
-  {
-    "path": "skill-creator",
-    "name": "Skill Creator",
-    "description": "Create new CLI skills following best practices",
-    "category": "meta",
-    "risk": "safe"
-  },
-  {
-    "path": "skill-scanner",
-    "name": "Skill Scanner",
-    "description": "Scan and analyze skills for security and quality",
-    "category": "security",
-    "risk": "safe"
-  },
-  {
-    "path": "skills-discovery",
-    "name": "Skills Discovery",
-    "description": "Search for and install Agent Skills",
-    "category": "meta",
-    "risk": "low"
-  },
-  {
-    "path": "task-decomposer",
-    "name": "Task Decomposer",
-    "description": "Break down complex tasks into manageable steps",
-    "category": "productivity",
-    "risk": "low"
-  },
-  {
-    "path": "taskmaster-setup",
-    "name": "TaskMaster Setup",
-    "description": "Configure TaskMaster AI with LiteLLM proxy",
-    "category": "infrastructure",
-    "risk": "low"
-  },
-  {
-    "path": "task-tracker-openclaw-skill",
-    "name": "Task Tracker",
-    "description": "Personal task management with daily standups and weekly reviews",
-    "category": "productivity",
+    "name": "antv-infographic",
+    "description": "",
+    "category": "uncategorized",
     "risk": "low"
   }
+,
+  {
+    "path": "code-reviewer",
+    "name": "code-reviewer",
+    "description": ">",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "doc-generator",
+    "name": "doc-generator",
+    "description": ">",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "error-analyzer",
+    "name": "error-analyzer",
+    "description": ">",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "litellm-cadastrador",
+    "name": "litellm-cadastrador",
+    "description": ">",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "mc-operator",
+    "name": "mc-operator",
+    "description": "",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "mineru",
+    "name": "mineru",
+    "description": "用 MinerU API 解析 PDF/Word/PPT/图片为 Markdown，支持公式、表格、OCR。适用于论文解析、文档提取。",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "openclaw-agent-creator",
+    "name": "openclaw-agent-creator",
+    "description": "Create and bootstrap new OpenClaw agents and their workspaces. Use when the user asks to create a new agent, add an isolated agent with `openclaw agents add`, set up an agent workspace, prepare AGENTS.md/SOUL.md/IDENTITY.md/USER.md/TOOLS.md/BOOTSTRAP.md/HEARTBEAT.md, turn an agent concept or template into a runnable OpenClaw agent, or iterate on an existing agent's behavior and guardrails.",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "openclaw-audit",
+    "name": "openclaw-audit",
+    "description": "Audit an OpenClaw installation for security, configuration, and workspace content quality. Use when the user asks to audit OpenClaw, review the agent workspace, check configuration health, verify security settings, assess workspace file quality, or identify gaps in agent setup. Covers both the technical config (openclaw.json) and the content quality of workspace files (SOUL.md, AGENTS.md, TOOLS.md, etc.).",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "openclaw-model-config",
+    "name": "openclaw-model-config",
+    "description": ""This skill generates complete OpenClaw model/provider configuration tables and provides comprehensive instructions for model modifications and provider management"",
+    "category": "configuration",
+    "risk": "safe"
+  }
+,
+  {
+    "path": "openclaw-session-governance",
+    "name": "openclaw-session-governance",
+    "description": "Audit and govern OpenClaw session lifecycle in a structured way. Use when reviewing session sprawl, distinguishing binding vs retention vs deletion, classifying persistent versus ephemeral sessions, generating cleanup candidate reports, or implementing recurring session hygiene for a local OpenClaw environment.",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "openclaw-update",
+    "name": "openclaw-update",
+    "description": ""Update OpenClaw gateway and CLI to the latest version. Use when: (1) User asks to 'atualizar openclaw' or 'update openclaw', (2) New OpenClaw version is available, (3) User wants to upgrade OpenClaw, (4) Post-update health check is needed, (5) User wants to run doctor or verify installation health."",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "prompt-improver",
+    "name": "prompt-improver",
+    "description": ">",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "repo-ecosystem-evaluator",
+    "name": "repo-ecosystem-evaluator",
+    "description": ""Evaluate repositories for architecture quality, semantic design coherence, and stack fit using standardized static metrics plus ATAM-lite and ISO/IEC 25010-aligned heuristics. Use when auditing unfamiliar repos, comparing alternatives, assessing adoption risk, or checking environment fit."",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "serena-source-consultation",
+    "name": "serena-source-consultation",
+    "description": "Use Serena plus local docs/source mirrors to verify real system behavior before making claims about architecture, configuration, hooks, agent behavior, or workspace-file semantics. Trigger when a task requires consulting source code, tracing implementation details, validating a plan against code, auditing a workspace against the actual code path, or checking drift between docs/config and implementation.",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "skill-check",
+    "name": "skill-check",
+    "description": ""Validate Claude Code skills against the agentskills specification. Catches structural, semantic, and naming issues before users do."",
+    "category": "development",
+    "risk": "safe"
+  }
+,
+  {
+    "path": "skill-creator",
+    "name": "skill-creator",
+    "description": ""To create new CLI skills following Anthropic's official best practices with zero manual configuration. This skill automates brainstorming, template application, validation, and installation processes while maintaining progressive disclosure patterns and writing style standards."",
+    "category": "meta",
+    "risk": "safe"
+  }
+,
+  {
+    "path": "skill-scanner",
+    "name": "skill-scanner",
+    "description": ">",
+    "category": "security",
+    "risk": "safe"
+  }
+,
+  {
+    "path": "skills-discovery",
+    "name": "skills-discovery",
+    "description": "Search for and install Agent Skills that give you specialized capabilities. Before starting work, ask might a skill exist that handles this better than my base knowledge? If the task involves specific technologies, frameworks, file formats, or expert domains. Search proactively, even if the user doesn't mention skills. Skills encode best practices, tools, and techniques you wouldn't otherwise have. Also use when users explicitly ask to find, install, or manage skills.",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "task-decomposer",
+    "name": "task-decomposer",
+    "description": ">",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "taskmaster-setup",
+    "name": "taskmaster-setup",
+    "description": "Configure TaskMaster AI with LiteLLM proxy in any project directory. Use when setting up task management for a new project, initializing TaskMaster, or troubleshooting TaskMaster + LiteLLM integration issues.",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+,
+  {
+    "path": "task-tracker-openclaw-skill",
+    "name": "task-tracker",
+    "description": ""Personal task management with daily standups and weekly reviews. Supports both Work and Personal tasks from Obsidian. Use when: (1) User says 'daily standup' or asks what's on my plate, (2) User says 'weekly review' or asks about last week's progress, (3) User wants to add/update/complete tasks, (4) User asks about blockers or deadlines, (5) User shares meeting notes and wants tasks extracted, (6) User asks 'what's due this week' or similar."",
+    "category": "uncategorized",
+    "risk": "low"
+  }
+
 ]

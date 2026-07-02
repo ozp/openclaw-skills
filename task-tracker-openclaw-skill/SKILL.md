@@ -65,11 +65,19 @@ python3 scripts/personal_standup.py
 
 ### Task listing and filtering
 
+`list` emits **markdown pipe tables** by default — one table per section, with columns `# | Status | Task | Área | Due`. Tasks are numbered sequentially across sections for easy reference (e.g. "move #8 to medium").
+
+Use `--plain` for legacy line-by-line output (e.g. when piping to other scripts).
+
 ```bash
-python3 scripts/tasks.py list
-python3 scripts/tasks.py list --priority high
-python3 scripts/tasks.py list --due today
-python3 scripts/tasks.py list --due this-week
+python3 scripts/tasks.py list                    # Table format (default)
+python3 scripts/tasks.py list --plain             # Plain text (legacy)
+python3 scripts/tasks.py list --priority high     # Filter by priority
+python3 scripts/tasks.py list --due today         # Filter by due date
+python3 scripts/tasks.py list --status done       # Only completed tasks
+python3 scripts/tasks.py list --completed-since 7d  # Done in last 7 days
+python3 scripts/tasks.py list --area openclaw     # Filter by area tag (partial match)
+python3 scripts/tasks.py list --search backup     # Full-text search in title + notes
 python3 scripts/tasks.py blockers
 ```
 
@@ -80,6 +88,34 @@ python3 scripts/tasks.py add "Draft proposal" --priority high --due 2026-01-23
 python3 scripts/tasks.py --personal add "Call mom" --priority high --due 2026-01-22
 python3 scripts/tasks.py done "proposal"
 python3 scripts/tasks.py --personal done "call mom"
+```
+
+### Move, edit, and inspect tasks
+
+**move** — Move a task between priority sections, preserving all metadata and notes.
+
+```bash
+python3 scripts/tasks.py move "UNIP MEC" --to medium
+python3 scripts/tasks.py move "mc-gateway" --to high
+```
+
+`--to` accepts: `high`, `medium`, `waiting`, `parking-lot`, `backlog`.
+
+**edit** — Modify properties of an existing task (title, area, due date, notes).
+
+```bash
+python3 scripts/tasks.py edit "mc-gateway" --append-note "Confirmed: session key resolution is the root cause"
+python3 scripts/tasks.py edit "some task" --area openclaw
+python3 scripts/tasks.py edit "old title" --title "New title"
+python3 scripts/tasks.py edit "task" --due 2026-04-15
+python3 scripts/tasks.py edit "task" --note "Replaces entire note block"
+```
+
+**show** — Display full details of a single task (status, section, area, due, notes, raw line).
+
+```bash
+python3 scripts/tasks.py show "mc-gateway"
+python3 scripts/tasks.py show "UNIP MEC"
 ```
 
 ### State transitions and backlog ops
@@ -132,7 +168,7 @@ Rules:
 - `read_link.py` is the mandatory pre-classification reader.
 - `review-inbox` is read-only and bounded to a small slice.
 - `route-item` is dry-run by default; require `--apply` for mutation.
-- Default behavior is **Option 2**: deterministic baseline + semantic check through LiteLLM/ModelRelay, with disagreement biased to `Review`.
+- Default behavior is **Option 2**: deterministic baseline + semantic check through LiteLLM/FreeLLMAPI, with disagreement biased to `Review`.
 - Use `--deterministic-only` when you want the old conservative control path.
 - Destination bookmark-state lists are `Incorporated` and `Review`; the inbox list is `Todo`.
 - The implemented reader chain is `karakeep -> github_api -> fetch/trafilatura`.

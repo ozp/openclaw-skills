@@ -106,7 +106,7 @@ def test_finalize_decision_biases_disagreement_to_review():
     semantic = {
         "enabled": True,
         "status": "ok",
-        "model": "modelrelay/auto-fastest",
+        "model": "freellm/auto",
         "reason": "semantic_result_available",
         "route": "review",
         "confidence": "high",
