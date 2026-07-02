@@ -145,5 +145,7 @@ def test_merge_operational_note_preserves_human_lines_and_rewrites_operational_b
     assert "manual note" in merged
     assert "task-ref: new-ref" in merged
     assert "read-source: github_api" in merged
-    assert "summary: A long enough repo summary" in merged
+    # summary agora vai na camada humana (📋), não mais como linha operacional summary:
+    assert "📋 A long enough repo summary" in merged
+    assert "summary: old" not in merged
     assert "old-ref" not in merged
