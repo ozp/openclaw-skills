@@ -24,6 +24,7 @@ def _env(tmp_path, work):
     env = os.environ.copy()
     env["TASK_TRACKER_WORK_FILE"] = str(work)
     env["TASK_TRACKER_DAILY_NOTES_DIR"] = str(tmp_path)
+    env["TASK_TRACKER_LEDGER_FILE"] = str(tmp_path / "events.jsonl")
     env["STANDUP_CALENDARS"] = "{}"
     return env
 
@@ -76,6 +77,8 @@ def test_primitive_schema_shape(tmp_path):
     assert "dos" in standup_payload
     assert "overdue" in standup_payload
     assert "carryover_suggestions" in standup_payload
+    assert "completion_candidates" in standup_payload
+    assert "task_audit" in standup_payload
 
     week_start = date.today() - timedelta(days=date.today().weekday())
     week_end = week_start + timedelta(days=6)
@@ -102,6 +105,22 @@ def test_primitive_schema_shape(tmp_path):
     assert "DO" in weekly_payload
     assert "by_area" in weekly_payload["DONE"]
     assert "by_category" in weekly_payload["DO"]
+    assert "completion_candidates" in weekly_payload
+    assert "task_audit" in weekly_payload
+
+    audit = subprocess.run(
+        ["python3", "scripts/tasks.py", "task-audit"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert audit.returncode == 0
+    audit_payload = json.loads(audit.stdout)
+    assert audit_payload["schema_version"] == "v1"
+    assert audit_payload["command"] == "task-audit"
+    assert "findings" in audit_payload
+    assert "summary" in audit_payload
 
     cal = subprocess.run(
         ["python3", "scripts/tasks.py", "calendar-sync"],
@@ -139,10 +158,49 @@ def test_ingest_daily_log_plain_bullets_and_exact_matching(tmp_path):
     assert payload["schema_version"] == "v1"
     assert payload["command"] == "ingest-daily-log"
     assert payload["totals"]["parsed_done_lines"] == 2
-    assert payload["totals"]["auto_linked"] == 2
-    assert payload["items"][0]["match_metadata"]["decision"] == "auto-link"
+    assert payload["totals"]["evidence_linked"] == 2
+    assert payload["items"][0]["match_metadata"]["decision"] == "evidence-link"
     assert payload["items"][0]["match_metadata"]["match_type"] in {"normalized-title", "exact-id-or-link"}
     assert payload["items"][1]["match_metadata"]["match_type"] == "exact-id-or-link"
+
+
+def test_primitive_summaries_include_completion_candidate_review_queue(tmp_path):
+    work = _write_work_file(tmp_path)
+    env = _env(tmp_path, work)
+    scan = subprocess.run(
+        ["python3", "scripts/tasks.py", "completion-candidates", "scan"],
+        input="- Ship alpha milestone\n",
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert scan.returncode == 0
+
+    standup = subprocess.run(
+        ["python3", "scripts/tasks.py", "standup-summary"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    weekly = subprocess.run(
+        ["python3", "scripts/tasks.py", "weekly-review-summary"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+
+    assert standup.returncode == 0
+    assert weekly.returncode == 0
+    standup_candidates = json.loads(standup.stdout)["completion_candidates"]
+    weekly_candidates = json.loads(weekly.stdout)["completion_candidates"]
+    assert standup_candidates["total"] == 1
+    assert weekly_candidates["total"] == 1
+    assert standup_candidates["items"][0]["candidate_id"].startswith("cand_")
+    assert standup_candidates["items"][0]["suggested_task_id"] == "A-1"
+    assert standup_candidates["items"][0]["review_required"] is True
 
 
 def test_ingest_daily_log_checkbox_and_fuzzy_threshold_bands(tmp_path):
@@ -212,11 +270,16 @@ def test_fallback_task_ids_are_unique_and_consistent_across_primitives(tmp_path)
     )
     assert standup.returncode == 0
     standup_payload = json.loads(standup.stdout)
-    standup_duplicate_ids = [
-        item["task_id"] for item in standup_payload["dos"] if item["title"] == "Duplicate title"
+    standup_duplicate_fallback_ids = [
+        item["fallback_id"] for item in standup_payload["dos"] if item["title"] == "Duplicate title"
     ]
-    assert len(standup_duplicate_ids) == 2
-    assert len(set(standup_duplicate_ids)) == 2
+    assert len(standup_duplicate_fallback_ids) == 2
+    assert len(set(standup_duplicate_fallback_ids)) == 2
+    assert all(
+        item["task_id"] is None and item["fallback_only"]
+        for item in standup_payload["dos"]
+        if item["title"] == "Duplicate title"
+    )
 
     week_start = date.today() - timedelta(days=date.today().weekday())
     week_end = week_start + timedelta(days=6)
@@ -237,10 +300,10 @@ def test_fallback_task_ids_are_unique_and_consistent_across_primitives(tmp_path)
     )
     assert weekly.returncode == 0
     weekly_payload = json.loads(weekly.stdout)
-    weekly_duplicate_ids = [
-        item["task_id"] for item in weekly_payload["DO"]["items"] if item["title"] == "Duplicate title"
+    weekly_duplicate_fallback_ids = [
+        item["fallback_id"] for item in weekly_payload["DO"]["items"] if item["title"] == "Duplicate title"
     ]
-    assert standup_duplicate_ids == weekly_duplicate_ids
+    assert standup_duplicate_fallback_ids == weekly_duplicate_fallback_ids
 
     ingest = subprocess.run(
         ["python3", "scripts/tasks.py", "ingest-daily-log"],
@@ -252,8 +315,8 @@ def test_fallback_task_ids_are_unique_and_consistent_across_primitives(tmp_path)
     )
     assert ingest.returncode == 0
     ingest_payload = json.loads(ingest.stdout)
-    mapped_id = ingest_payload["items"][0]["canonical_task"]["task_id"]
-    assert mapped_id == sorted(standup_duplicate_ids)[0]
+    assert ingest_payload["items"][0]["canonical_task"]["task_id"] is None
+    assert ingest_payload["items"][0]["canonical_task"]["fallback_only"] is True
 
 
 def test_ingest_daily_log_strips_time_prefix_before_checkmark(tmp_path):
@@ -272,7 +335,7 @@ def test_ingest_daily_log_strips_time_prefix_before_checkmark(tmp_path):
     payload = json.loads(proc.stdout)
     assert payload["totals"]["parsed_done_lines"] == 1
     assert payload["items"][0]["parsed_title"] == "Ship alpha milestone"
-    assert payload["items"][0]["match_metadata"]["decision"] == "auto-link"
+    assert payload["items"][0]["match_metadata"]["decision"] == "evidence-link"
     assert payload["items"][0]["match_metadata"]["match_type"] == "normalized-title"
 
 
@@ -291,7 +354,7 @@ def test_ingest_daily_log_disambiguates_cross_repo_issue_urls(tmp_path):
     assert proc.returncode == 0
     payload = json.loads(proc.stdout)
     assert payload["totals"]["parsed_done_lines"] == 1
-    assert payload["totals"]["auto_linked"] == 1
-    assert payload["items"][0]["match_metadata"]["decision"] == "auto-link"
+    assert payload["totals"]["evidence_linked"] == 1
+    assert payload["items"][0]["match_metadata"]["decision"] == "evidence-link"
     assert payload["items"][0]["match_metadata"]["match_type"] == "exact-id-or-link"
     assert payload["items"][0]["canonical_task"]["title"] == "Repo B issue 42"

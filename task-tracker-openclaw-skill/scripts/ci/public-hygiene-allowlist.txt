@@ -5,3 +5,8 @@
 #   RULE|path/to/file:line
 #
 # Use sparingly for intentional examples that would otherwise trigger checks.
+
+# Pre-existing SMS candidate/harvest test fixtures use reserved-for-fiction US numbers
+# (the +1-555-01xx range), not real phone numbers. Not introduced by this feature.
+PHONE_NUMBER|tests/test_completion_candidates.py
+PHONE_NUMBER|tests/test_harvest_auto.py

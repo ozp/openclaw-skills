@@ -1,6 +1,9 @@
 # Task Tracker Architecture
 
-A markdown-based personal task management system with daily standups, weekly reviews, and automated priority escalation. All data lives in plain markdown files — no database, no server.
+A markdown-based personal task management system with daily standups, weekly
+reviews, and automated priority escalation. Active tasks stay editable in plain
+markdown, while durable lifecycle history lives in an append-only JSONL sidecar
+ledger.
 
 ---
 
@@ -25,12 +28,20 @@ graph TD
         UTILS["utils.py"]
         DN["daily_notes.py"]
         LD["log_done.py"]
+        TI["task_identity.py"]
+        TL["task_ledger.py"]
+        TR["task_repair.py"]
+        TT["task_transitions.py"]
+        REC["task_records.py"]
+        EM["evidence_matching.py"]
+        LINES["task_lines.py"]
         SC["standup_common.py"]
     end
 
     subgraph "Data Files"
         DAILY["Daily Notes<br/>YYYY-MM-DD.md"]
         ARCHIVE["Quarterly Archive<br/>ARCHIVE-YYYY-QN.md"]
+        LEDGER["Task Event Ledger<br/>*.events.jsonl"]
     end
 
     subgraph "Integrations"
@@ -42,7 +53,13 @@ graph TD
     TASKS --> UTILS
     TASKS --> DN
     TASKS --> LD
+    TASKS --> TI
+    TASKS --> TL
+    TASKS --> TR
+    TASKS --> TT
+    TASKS --> REC
     STANDUP --> UTILS
+    STANDUP --> REC
     STANDUP --> DN
     STANDUP --> SC
     PSTANDUP --> UTILS
@@ -59,6 +76,11 @@ graph TD
     WEEKLY -->|read| WT
 
     LD -->|append| DAILY
+    TL -->|append| LEDGER
+    TR -->|repair IDs| WT
+    TT -->|ID mutations| WT
+    REC -->|shared parsed record| UTILS
+    TT --> LINES
     DN -->|read| DAILY
     WEEKLY -->|write| ARCHIVE
 
@@ -253,7 +275,16 @@ sequenceDiagram
 | | `--due YYYY-MM-DD` | Set due date |
 | | `--owner NAME` | Assign owner |
 | | `--area CATEGORY` | Set area/category |
-| `done "query"` | | Fuzzy-match and complete a task |
+| `done "task_id"` | | Complete exactly one active task by canonical ID |
+| `identity-audit` | | Report missing, duplicate, and malformed task IDs without writing |
+| `identity-repair` | `--apply` | Add safe missing `task_id::` metadata |
+| `task-audit` | `--stale-days`, `--candidate-days`, `--backlog-cap` | Report task-health findings without writing |
+| `ingest-daily-log` | `--file PATH` | Report completion evidence links; no task writes |
+| `completion-candidates scan` | `--file PATH`, `--date YYYY-MM-DD` | Persist completion evidence candidates; no task writes |
+| `completion-candidates list/show` | `--all`, `--mark-shown` | Review candidate inbox and event history |
+| `completion-candidates confirm` | `--task-id TASK_ID` | Complete through canonical ID-only `done` semantics |
+| `completion-candidates reject/duplicate/snooze` | `--reason`, `--of`, `--until YYYY-MM-DD` | Record candidate decisions without task writes |
+| `completion_inbox_control.py` | `list/show/reject/snooze/confirm` | Workflow-safe control wrapper over existing inbox commands |
 | `blockers` | `--person NAME` | Show blocking tasks |
 | `archive` | | Archive done tasks to quarterly file |
 
@@ -315,6 +346,14 @@ sequenceDiagram
 | `tasks.py list` | Task board | — |
 | `tasks.py add` | Task board | Task board (insert line) |
 | `tasks.py done` | Task board, daily notes | Task board (remove/update line), daily note (append) |
+| `tasks.py identity-audit` | Task board | — |
+| `tasks.py task-audit` | Task board, ledger, parking lot | — |
+| `tasks.py ingest-daily-log` | Task board, done text | — |
+| `tasks.py completion-candidates scan` | Task board, done text, ledger | Ledger candidate events |
+| `tasks.py completion-candidates list/show` | Ledger | Ledger only with `--mark-shown` |
+| `tasks.py completion-candidates confirm` | Ledger, task board, daily notes | Task board, daily note, ledger |
+| `tasks.py completion-candidates reject/duplicate/snooze` | Ledger | Ledger candidate events |
+| `completion_inbox_control.py` | Ledger, task board through confirm only | Delegates to existing inbox decision paths |
 | `tasks.py archive` | Daily notes | Quarterly archive |
 | `standup.py` | Task board, daily notes, calendar | — |
 | `personal_standup.py` | Task board, daily notes, calendar | — |
@@ -327,6 +366,10 @@ sequenceDiagram
 - `log_done.py` is append-only — never overwrites existing data
 - Archive operations are idempotent — skip entries already present
 - Priority escalation is read-only — task files are never mutated for display
+- Fuzzy/title evidence is read-only by default and cannot complete canonical tasks
+- Fallback IDs in JSON are diagnostics only; writes require `task_id::` or readable legacy `id::`
+- Completion candidates are suggestions until confirmed through the canonical
+  ID-only completion path
 
 ---
 
@@ -334,7 +377,7 @@ sequenceDiagram
 
 ### Calendar (gog CLI)
 
-`standup_common.py` calls `gog calendar list <calendar_id> --account <account> --today --json` for each configured calendar. Configured via `STANDUP_CALENDARS` env var (JSON object keyed by label). Silently skipped if `gog` is unavailable or config is unset.
+`standup_common.py` calls `gog calendar list <calendar_id> --account <account> --today --json` for each configured calendar. Configured via `STANDUP_CALENDARS` env var (JSON object keyed by label). Silently skipped if `gog` is unavailable or config is unset. Calendar data is evidence/display input only; it does not mutate task truth.
 
 ### Telegram (task-shortcuts.sh)
 

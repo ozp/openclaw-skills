@@ -1,0 +1,11 @@
+{
+  "name": "task-tracker-envelope-signer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenClaw inbound-message plugin: owner-verifies conversational completion/open-list text and posts task-tracker tt:done confirm buttons.",
+  "main": "index.js",
+  "scripts": {
+    "test": "node test-handler.mjs"
+  }
+}

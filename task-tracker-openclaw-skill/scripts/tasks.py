@@ -3,10 +3,11 @@
 Task Tracker CLI - Supports both Work and Personal tasks.
 
 Usage:
-    tasks.py list [--priority high|medium|low] [--status open|done] [--completed-since 24h|7d|30d] [--due today|this-week|overdue|due-or-overdue] [--plain]
+    tasks.py list [--priority high|medium|low] [--status open|done] [--completed-since 24h|7d|30d] [--due today|this-week|overdue|due-or-overdue] [--area AREA] [--search TEXT] [--plain]
     tasks.py --personal list
     tasks.py add "Task title" [--priority high|medium|low] [--due YYYY-MM-DD]
-    tasks.py done "task query"
+    tasks.py done "task_id"
+    tasks.py revert "completion_id"
     tasks.py blockers [--person NAME]
     tasks.py archive
 """
@@ -16,16 +17,37 @@ import json
 import os
 import re
 import sys
-from difflib import SequenceMatcher
+import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent))
+import error_envelope
 from daily_notes import extract_completed_tasks
-from log_done import log_task_completed
+from candidate_review import candidate_review_summary
+from evidence_matching import (
+    FUZZY_EVIDENCE_LINK_THRESHOLD,
+    FUZZY_REVIEW_THRESHOLD,
+    build_task_catalog,
+    canonical_record as _canonical_record,
+    extract_done_lines,
+    match_evidence_line,
+    safe_load_task_records as _safe_load_task_records,
+)
 from standup_common import get_calendar_events, flatten_calendar_events
 import delegation
+from task_identity import audit_payload, print_json as print_identity_json
+from task_audit import collect_task_audit, task_audit_summary
+from task_lines import remove_task_line
+from task_repair import repair_missing_ids
+from task_transitions import block_unsafe_query, cancel_by_id, complete_by_id, print_result, revert_completion
+from rollover import run_rollover
+from task_records import (
+    active_records,
+    record_to_task_dict,
+    task_records,
+)
 from utils import (
     detect_format,
     get_tasks_file,
@@ -33,15 +55,21 @@ from utils import (
     parse_tasks,
     load_tasks,
     check_due_date,
-    next_recurrence_date,
     get_current_quarter,
     ARCHIVE_DIR,
     get_objective_progress,
+    _atomic_write,
 )
 
+COMPLETION_ID_RE = re.compile(r"evt_[0-9a-f]{32}")
 TASK_PRIMITIVES_SCHEMA_VERSION = "v1"
-FUZZY_AUTO_LINK_THRESHOLD = 0.90
-FUZZY_REVIEW_THRESHOLD = 0.70
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
 
 
 def list_tasks(args):
@@ -82,53 +110,34 @@ def list_tasks(args):
 
     if getattr(args, 'search', None):
         search_query = args.search.lower()
-        # Load content for full-text search through notes
-        tasks_file, fmt = get_tasks_file(args.personal)
-        if tasks_file.exists():
-            file_content = tasks_file.read_text()
-        else:
-            file_content = ''
+        tasks_file, _ = get_tasks_file(args.personal)
+        file_content = tasks_file.read_text(encoding='utf-8') if tasks_file.exists() else ''
         search_results = []
-        for t in filtered:
-            if search_query in t.get('title', '').lower():
-                search_results.append(t)
+        for task in filtered:
+            if search_query in task.get('title', '').lower():
+                search_results.append(task)
                 continue
-            # Check raw_line and continuation notes
-            raw = t.get('raw_line', '').lower()
-            if search_query in raw:
-                search_results.append(t)
+            raw_line = task.get('raw_line', '')
+            if search_query in raw_line.lower():
+                search_results.append(task)
                 continue
-            # Extract task block from file content for full note search
-            rl = t.get('raw_line', '')
-            if rl and file_content:
+            if raw_line and file_content:
                 lines = file_content.split('\n')
                 try:
-                    start_idx = lines.index(rl)
+                    start_idx = lines.index(raw_line)
                 except ValueError:
                     start_idx = -1
                 if start_idx >= 0:
-                    target_indent = len(rl) - len(rl.lstrip(' '))
-                    j = start_idx + 1
-                    while j < len(lines):
-                        line = lines[j]
-                        if line.strip() == '':
-                            k = j + 1
-                            while k < len(lines) and lines[k].strip() == '':
-                                k += 1
-                            if k < len(lines):
-                                ni = len(lines[k]) - len(lines[k].lstrip(' '))
-                                if ni > target_indent:
-                                    j += 1
-                                    continue
-                            break
-                        ni = len(line) - len(line.lstrip(' '))
-                        if ni > target_indent:
-                            if search_query in line.lower():
-                                search_results.append(t)
-                                break
-                            j += 1
+                    target_indent = len(raw_line) - len(raw_line.lstrip(' '))
+                    for note_line in lines[start_idx + 1:]:
+                        if not note_line.strip():
                             continue
-                        break
+                        note_indent = len(note_line) - len(note_line.lstrip(' '))
+                        if note_indent <= target_indent:
+                            break
+                        if search_query in note_line.lower():
+                            search_results.append(task)
+                            break
         filtered = search_results
 
     if args.completed_since:
@@ -175,113 +184,159 @@ def list_tasks(args):
         task_type = "Personal" if args.personal else "Work"
         print(f"No {task_type} tasks found matching criteria.")
         return
-
+    
     use_table = not getattr(args, 'plain', False)
     task_type = "Personal" if args.personal else "Work"
-    print(f"📋 {task_type} Tasks ({len(filtered)} items)\n")
+    print(f"\n📋 {task_type} Tasks ({len(filtered)} items)\n")
 
-    # Section display config: section_key -> (emoji_header, icon_order)
-    section_config = [
-        ('q1', '🔴 High Priority'),
-        ('q2', '🟡 Medium Priority'),
-        ('q3', '🟠 Waiting / Delegated'),
-        ('parking_lot', '🅿️ Parking Lot'),
-        ('backlog', '⚪ Backlog'),
-        ('done', '✅ Done'),
-        ('today', '📌 Today'),
-        ('objectives', '🎯 Objectives'),
-        ('team', '👥 Team'),
-    ]
-    section_order = {s[0]: i for i, s in enumerate(section_config)}
-    section_headers = {s[0]: s[1] for s in section_config}
-
-    # Group tasks by section, preserving order
-    grouped: dict[str, list] = {}
-    for task in filtered:
-        sec = task.get('section') or 'uncategorized'
-        grouped.setdefault(sec, []).append(task)
-
-    # Sort sections by defined order, unknown sections last
-    sorted_sections = sorted(grouped.keys(), key=lambda s: section_order.get(s, 99))
-
+    current_section = None
     global_counter = 0
-
-    for sec in sorted_sections:
-        tasks_in_section = grouped[sec]
-        header = section_headers.get(sec, get_section_display_name(sec, args.personal))
-
-        if use_table:
-            print(f"## {header}\n")
-            print("| # | Status | Task | Área | Due |")
-            print("|---|--------|------|------|-----|")
-
-        for task in tasks_in_section:
-            global_counter += 1
-            checkbox = '✅' if task['done'] else '⬜'
-            title = task['title']
-            # Truncate very long titles for table readability
-            if use_table and len(title) > 80:
-                title = title[:77] + '...'
-            # Escape pipe characters in title for markdown tables
-            title = title.replace('|', '\\|')
-            area = task.get('area') or '—'
-            area = area.replace('|', '\\|')
-            due = task.get('due', '—') or '—'
-
+    for idx, task in enumerate(filtered):
+        section = task.get('section')
+        if section != current_section:
+            current_section = section
+            print(f"### {get_section_display_name(section, args.personal)}\n")
             if use_table:
-                print(f"| {global_counter} | {checkbox} | {title} | {area} | {due} |")
-            else:
-                due_str = f" (🗓️{task['due']})" if task.get('due') else ''
-                area_str = f" [{task.get('area')}]" if task.get('area') else ''
-                print(f"{checkbox} **{title}**{due_str}{area_str}")
+                print("| # | Status | Task | Area | Due |")
+                print("|---|--------|------|------|-----|")
+
+        global_counter += 1
+        checkbox = '✅' if task['done'] else '⬜'
+        title = task['title']
+        due = task.get('due') or '-'
+        area = task.get('area') or '-'
 
         if use_table:
-            print()
+            if len(title) > 80:
+                title = title[:77] + '...'
+            title = title.replace('|', '\\|')
+            area = area.replace('|', '\\|')
+            print(f"| {global_counter} | {checkbox} | {title} | {area} | {due} |")
+        else:
+            due_str = f" (🗓️{task['due']})" if task.get('due') else ''
+            area_str = f" [{task.get('area')}]" if task.get('area') else ''
+            print(f"{checkbox} **{task['title']}**{due_str}{area_str}")
+
+        if use_table:
+            next_index = idx + 1
+            if next_index >= len(filtered) or filtered[next_index].get('section') != current_section:
+                print()
 
 
-def add_task(args):
-    """Add a new task."""
-    tasks_file, format = get_tasks_file(args.personal)
-    
-    if not tasks_file.exists():
-        print(f"❌ Tasks file not found: {tasks_file}")
-        return
-    
-    content = tasks_file.read_text()
-    
-    # Build task entry with emoji date format
-    priority_patterns = {
-        'high': r'## 🔴',
-        'medium': r'## 🟡',
-        'low': r'## ⚪',
-    }
-    priority_pattern = priority_patterns.get(args.priority, r'## 🟡')
-    
-    # Build task line
-    task_line = f'- [ ] **{args.title}**'
-    if args.due:
-        task_line += f' 🗓️{args.due}'
-    if args.area:
-        task_line += f' area:: {args.area}'
-    if getattr(args, 'task_type', None):
-        task_line += f' type:: {args.task_type}'
-    if getattr(args, 'estimate', None):
-        task_line += f' estimate:: {args.estimate}'
-    if getattr(args, 'note_meta', None):
-        for note_value in args.note_meta:
-            if note_value:
-                task_line += f' note:: {note_value}'
+def _add_destination_is_active(priority: str | None, content: str) -> bool:
+    """True when an add with this priority lands in an ACTIVE board section.
+
+    The cap must scope to where the task ACTUALLY lands. ``--priority low`` only
+    routes to the inactive Backlog when a ``## ⚪`` Backlog section exists; with no
+    Backlog section the add falls back to the active ``## 📋 All Tasks`` area
+    (section=None, counted as active), so it MUST be gated. Deriving this from the
+    real board content keeps the gate's notion of "active" from drifting from the
+    writer's insertion fallback. Reuses ``PRIORITY_TO_SECTION``/``INACTIVE_SECTIONS``
+    so it never drifts from ``active_records()`` either.
+    """
+    from task_records import INACTIVE_SECTIONS
+    from utils import PRIORITY_TO_SECTION
+
+    section = PRIORITY_TO_SECTION.get(priority or "medium", "q2")
+    if section not in INACTIVE_SECTIONS:
+        return True
+    # The destination section is nominally inactive (Backlog) -- but only honour
+    # that if the board actually has a Backlog header for the writer to target.
+    has_backlog = re.search(r'^##\s+⚪(?:\s|$)', content, re.MULTILINE) is not None
+    return not has_backlog
+
+
+def _log_wip_cap_enforced(title: str, summary, routing: str | None) -> None:
+    """Append a ``wip_cap_enforced`` ledger event (best-effort).
+
+    H6: an over-cap add is captured to the parking lot (the cap gates promotion,
+    not capture). The add is a user-initiated CLI command, so ``source="user_command"``
+    -- the routing decision rides in ``proposed_routing`` metadata, not by
+    mislabeling the actor source.
+    """
+    try:
+        from task_ledger import append_event, new_event
+
+        metadata = {"task_title": title}
+        if summary is not None:
+            metadata.update(
+                {
+                    "current_count": summary.active_count,
+                    "estimated_minutes": summary.estimated_minutes,
+                    "capacity_minutes": summary.capacity_minutes,
+                    "hard_cap": summary.hard_cap,
+                }
+            )
+        if routing:
+            metadata["proposed_routing"] = routing
+        append_event(
+            new_event(
+                "wip_cap_enforced",
+                actor="niemand-work",
+                source="user_command",
+                metadata=metadata,
+            )
+        )
+    except Exception:
+        pass
+
+
+def _build_active_task_line(title: str, *, due: str | None = None,
+                            area: str | None = None, owner: str | None = None,
+                            task_id: str | None = None,
+                            estimate: str | None = None) -> tuple[str, str]:
+    """Build a canonical active-board task line. Returns (task_line, task_id).
+
+    The single home for the active task-line shape so ``add_task`` (capture) and
+    the H6 ``promote``/``swap`` paths emit byte-identical lines -- a promoted task
+    must look exactly like a directly-added one, never a parking-lot variant.
+
+    ``estimate`` is optional; when supplied it emits the SAME ``estimate:: <val>``
+    token ``parse_tasks`` reads for the capacity cap, so a promoted task restores
+    the original estimate and ``focus_core`` counts it at its real load rather than
+    the unestimated default. The under-cap add path passes no estimate (the CLI has
+    no ``--estimate`` arg), so its behavior is unchanged -- no stray token.
+    """
+    task_id = task_id or f"tsk_{uuid.uuid4().hex[:16]}"
+    task_line = f'- [ ] **{title}**'
+    if due:
+        task_line += f' 🗓️{due}'
+    task_line += f' task_id::{task_id}'
+    if area:
+        task_line += f' area:: {area}'
+    if estimate:
+        task_line += f' estimate:: {estimate}'
     default_owner = os.getenv('TASK_TRACKER_DEFAULT_OWNER', 'me')
-    if args.owner and args.owner not in ('me', default_owner):
-        task_line += f' owner:: {args.owner}'
-    
-    # Find section and insert after header
-    section_match = re.search(rf'({priority_pattern}[^\n]*\n)', content)
-    
-    if section_match:
-        insert_pos = section_match.end()
-        # Skip any subsection headers or blank lines
-        remaining = content[insert_pos:]
+    if owner and owner not in ('me', default_owner):
+        task_line += f' owner:: {owner}'
+    return task_line, task_id
+
+
+def _insert_active_task(content: str, priority: str | None, area: str | None,
+                        task_line: str) -> str | None:
+    """Splice ``task_line`` into the active section for ``priority``.
+
+    Mirrors ``add_task``'s section-resolution fallbacks (legacy priority anchor ->
+    All Tasks dept -> first dept header). Returns the new board content, or None
+    when no insertion anchor exists. Shared by capture, promote and swap so all
+    three insert into the same place.
+    """
+    priority_patterns = {
+        'high': r'^##\s+🔴(?:\s|$)',
+        'medium': r'^##\s+🟡(?:\s|$)',
+        'low': r'^##\s+⚪(?:\s|$)',
+    }
+    priority_pattern = priority_patterns.get(priority, r'^##\s+🟡(?:\s|$)')
+
+    def _next_h2_pos(text: str, start_pos: int) -> int:
+        match = re.search(r'^##\s+', text[start_pos:], re.MULTILINE)
+        if not match:
+            return len(text)
+        return start_pos + match.start()
+
+    def _advance_after_header(text: str, start_pos: int) -> int:
+        insert_at = start_pos
+        remaining = text[insert_at:]
         lines = remaining.split('\n')
         skip_lines = 0
         for line in lines:
@@ -289,54 +344,64 @@ def add_task(args):
                 skip_lines += 1
             else:
                 break
-        insert_pos += sum(len(lines[i]) + 1 for i in range(skip_lines))
-        
-        new_content = content[:insert_pos] + task_line + '\n' + content[insert_pos:]
-        tasks_file.write_text(new_content)
-        task_type = "Personal" if args.personal else "Work"
-        print(f"✅ Added {task_type} task: {args.title}")
+        return insert_at + sum(len(lines[i]) + 1 for i in range(skip_lines))
+
+    # 1) Legacy priority anchors (## 🔴 / ## 🟡 / ## ⚪)
+    section_match = re.search(priority_pattern, content, re.MULTILINE)
+    insert_pos = None
+    if section_match:
+        header_end = content.find('\n', section_match.start())
+        if header_end == -1:
+            header_end = len(content)
+        else:
+            header_end += 1
+        insert_pos = _advance_after_header(content, header_end)
     else:
-        print(f"⚠️ Could not find section matching '{priority_pattern}'. Add manually.")
+        # 2) Fallback: ## 📋 All Tasks (or plain ## All Tasks)
+        all_tasks_match = re.search(r'^##\s+(?:📋\s+)?All Tasks(?:\s|$)', content, re.MULTILINE)
+        if all_tasks_match:
+            all_tasks_header_end = content.find('\n', all_tasks_match.start())
+            if all_tasks_header_end == -1:
+                all_tasks_header_end = len(content)
+            else:
+                all_tasks_header_end += 1
+
+            all_tasks_section_end = _next_h2_pos(content, all_tasks_header_end)
+            all_tasks_body = content[all_tasks_header_end:all_tasks_section_end]
+
+            dept_match = None
+            if area:
+                area_re = re.escape(area.strip())
+                dept_match = re.search(rf'^###.*\b{area_re}\b.*$', all_tasks_body, re.MULTILINE | re.IGNORECASE)
+            if not dept_match:
+                dept_match = re.search(r'^###\s+.+$', all_tasks_body, re.MULTILINE)
+
+            if dept_match:
+                dept_header_end = all_tasks_header_end + dept_match.end()
+                if dept_header_end < len(content) and content[dept_header_end] != '\n':
+                    nl_pos = content.find('\n', dept_header_end)
+                    dept_header_end = len(content) if nl_pos == -1 else nl_pos + 1
+                insert_pos = _advance_after_header(content, dept_header_end)
+            else:
+                insert_pos = _advance_after_header(content, all_tasks_header_end)
+        else:
+            # 3) Final fallback: first department header anywhere
+            dept_match = re.search(r'^###\s+.+$', content, re.MULTILINE)
+            if dept_match:
+                dept_header_end = content.find('\n', dept_match.start())
+                if dept_header_end == -1:
+                    dept_header_end = len(content)
+                else:
+                    dept_header_end += 1
+                insert_pos = _advance_after_header(content, dept_header_end)
+
+    if insert_pos is None:
+        return None
+    return content[:insert_pos] + task_line + '\n' + content[insert_pos:]
 
 
-def _remove_task_line(content: str, raw_line: str) -> str:
-    """Remove a task line and its child/continuation lines."""
-    lines = content.split('\n')
-    try:
-        target_index = lines.index(raw_line)
-    except ValueError:
-        return content
-
-    target_indent = len(raw_line) - len(raw_line.lstrip(' '))
-    remove_until = target_index + 1
-
-    while remove_until < len(lines):
-        line = lines[remove_until]
-
-        if line.strip() == '':
-            lookahead = remove_until + 1
-            while lookahead < len(lines) and lines[lookahead].strip() == '':
-                lookahead += 1
-
-            if lookahead < len(lines):
-                next_line = lines[lookahead]
-                next_indent = len(next_line) - len(next_line.lstrip(' '))
-                if next_indent > target_indent:
-                    remove_until += 1
-                    continue
-            break
-
-        indent = len(line) - len(line.lstrip(' '))
-        if indent > target_indent:
-            remove_until += 1
-            continue
-        break
-
-    return '\n'.join(lines[:target_index] + lines[remove_until:])
-
-
-def done_task(args):
-    """Complete a task: log to daily notes and remove from the board."""
+def add_task(args):
+    """Add a new task."""
     tasks_file, format = get_tasks_file(args.personal)
 
     if not tasks_file.exists():
@@ -344,84 +409,534 @@ def done_task(args):
         return
 
     content = tasks_file.read_text()
-    tasks_data = parse_tasks(content, args.personal, format)
-    tasks = tasks_data['all']
 
-    query = args.query.lower()
-    matches = [t for t in tasks if query in t['title'].lower() and not t['done']]
+    # Layer-2 active-inventory cap (Contract 6 / Decision #7 + H6): a WRITE-TIME
+    # gate. The decision is computed once in focus_core (the canonical capacity
+    # layer) AFTER reading the file and BEFORE any board write. H6: capture NEVER
+    # blocks -- when the active set is full the new task is ALWAYS captured to the
+    # parking lot (the inbox) and the add SUCCEEDS, so a commitment is never pushed
+    # out of the system into the user's head. The cap now gates PROMOTION onto the
+    # active board (see promote/swap), not capture. The cap is date-INDEPENDENT (it
+    # governs total active load, not today's plan), so a skipped morning ritual
+    # never silences it; it NEVER force-evicts.
+    #
+    # Scope: the cap governs the WORK board only (the knobs are sized for the work
+    # inventory), matching standup / standup-summary -- a personal add is never
+    # gated. And it only fires for adds destined for an ACTIVE section:
+    # --priority low routes to the inactive Backlog (excluded from active_records),
+    # so it adds zero active load and lands on the board normally.
+    from focus_core import evaluate_add
 
-    if not matches:
-        print(f"No matching task found for: {args.query}")
-        return
-
-    if len(matches) > 1:
-        print(f"Multiple matches found:")
-        for i, t in enumerate(matches, 1):
-            print(f"  {i}. {t['title']}")
-        print("\nBe more specific.")
-        return
-
-    task = matches[0]
-
-    old_line = task.get('raw_line', '')
-    if not old_line:
-        print("⚠️ Could not find task line to update.")
-        return
-
-    # Log completion to daily notes — abort board changes if this fails
-    logged = log_task_completed(
-        title=task['title'],
-        section=task.get('section'),
-        area=task.get('area'),
-        due=task.get('due'),
-        recur=task.get('recur'),
+    destination_active = (not args.personal) and _add_destination_is_active(args.priority, content)
+    gate = evaluate_add(
+        content,
+        format,
+        args.title,
+        destination_active=destination_active,
+        personal=args.personal,
     )
-    if not logged:
-        print(
-            "❌ Could not log completion to daily notes. "
-            "Task was NOT removed from the board to prevent data loss.\n"
-            "Check that TASK_TRACKER_DAILY_NOTES_DIR (or TASK_TRACKER_DONE_LOG_DIR) "
-            "is set and writable.",
-            file=sys.stderr,
+    if not gate.allowed:
+        # H6 Fix 1: over-cap => capture to the parking lot and SUCCEED. This is now
+        # the DEFAULT (no flag required); --force-parking is kept as a harmless
+        # alias since the over-cap path already routes to parking. Only a real
+        # capture FAILURE (add_item returns an "❌" string -- lot full / no
+        # section) is surfaced as a non-zero exit, so a task that truly cannot be
+        # saved is never reported as captured.
+        from parking_lot import add_item
+
+        # Thread --due / --owner through so a captured task does not silently lose
+        # its due date or owner ("saved, not lost"). They ride on the parked line
+        # and /promote re-derives them onto the restored active line (H6 Fix 2).
+        # The default owner ("me") is suppressed -- the same round-trip rule as
+        # _build_active_task_line -- so a normal capture carries no stray owner.
+        default_owner = os.getenv('TASK_TRACKER_DEFAULT_OWNER', 'me')
+        capture_owner = args.owner if args.owner and args.owner not in ('me', default_owner) else None
+        result = add_item(
+            tasks_file, args.title, dept=args.area, priority="low",
+            due=args.due, owner=capture_owner,
         )
+        if result.startswith("❌"):
+            print(result)
+            sys.exit(2)
+        summary = gate.summary
+        cap_h = (summary.capacity_minutes // 60) if summary else 0
+        active_n = summary.active_count if summary else 0
+        print(
+            f"📥 Captured to the parking lot — you're at capacity "
+            f"({active_n} committed / ~{cap_h}h). It's saved, not lost.\n"
+            f"Promote it with /promote <id> when there's room, or "
+            f"/swap <out_id> <id> to make room now."
+        )
+        _log_wip_cap_enforced(args.title, gate.summary, routing="parking_lot")
         return
 
-    completed_today = datetime.now().strftime('%Y-%m-%d')
-    recur_value = (task.get('recur') or '').strip()
+    task_line, task_id = _build_active_task_line(
+        args.title, due=args.due, area=args.area, owner=args.owner
+    )
+    new_content = _insert_active_task(content, args.priority, args.area, task_line)
+    if new_content is None:
+        priority_patterns = {
+            'high': r'^##\s+🔴(?:\s|$)',
+            'medium': r'^##\s+🟡(?:\s|$)',
+            'low': r'^##\s+⚪(?:\s|$)',
+        }
+        priority_pattern = priority_patterns.get(args.priority, r'^##\s+🟡(?:\s|$)')
+        print(f"⚠️ Could not find section matching '{priority_pattern}'. Add manually.")
+        return
 
-    if recur_value:
-        # Recurring: replace with next instance (no completed line on board)
-        from_date = task.get('due') or completed_today
-        try:
-            next_due = next_recurrence_date(recur_value, from_date)
-            next_task_line = old_line
-
-            if re.search(r'🗓️\d{4}-\d{2}-\d{2}', next_task_line):
-                next_task_line = re.sub(
-                    r'🗓️\d{4}-\d{2}-\d{2}',
-                    f'🗓️{next_due}',
-                    next_task_line,
-                    count=1,
-                )
-            else:
-                inline_field_match = re.search(r'\s+\w+::', next_task_line)
-                if inline_field_match:
-                    pos = inline_field_match.start()
-                    next_task_line = f"{next_task_line[:pos]} 🗓️{next_due}{next_task_line[pos:]}"
-                else:
-                    next_task_line = f"{next_task_line.rstrip()} 🗓️{next_due}"
-
-            new_content = content.replace(old_line, next_task_line, 1)
-        except ValueError as e:
-            print(f"⚠️ Could not create recurring task for '{task['title']}': {e}")
-            new_content = _remove_task_line(content, old_line)
-    else:
-        # Non-recurring: remove the task line entirely
-        new_content = _remove_task_line(content, old_line)
-
-    tasks_file.write_text(new_content)
+    _atomic_write(tasks_file, new_content)
     task_type = "Personal" if args.personal else "Work"
-    print(f"✅ Completed {task_type} task: {task['title']}")
+    print(f"✅ Added {task_type} task: {args.title} ({task_id})")
+
+
+def _log_promotion_event(event_type: str, *, title: str, summary, extra: dict | None = None) -> None:
+    """Append a ``task_promoted`` / ``task_swapped`` ledger event (best-effort).
+
+    A promote/swap is a user CLI command, so ``source="user_command"``. The
+    capacity snapshot at the time of the move rides in metadata so an auditor can
+    see the committed load the promotion landed against.
+    """
+    try:
+        from task_ledger import append_event, new_event
+
+        metadata = {"task_title": title}
+        if summary is not None:
+            metadata.update(
+                {
+                    "current_count": summary.active_count,
+                    "estimated_minutes": summary.estimated_minutes,
+                    "capacity_minutes": summary.capacity_minutes,
+                    "hard_cap": summary.hard_cap,
+                }
+            )
+        if extra:
+            metadata.update(extra)
+        append_event(
+            new_event(
+                event_type,
+                actor="niemand-work",
+                source="user_command",
+                metadata=metadata,
+            )
+        )
+    except Exception:
+        pass
+
+
+def _find_parked_item(content: str, item_id: int):
+    """Return the parked item dict for ``item_id``, or None.
+
+    Parses the Parking Lot via the same helpers the parking-lot CLI uses, so the
+    promote/swap notion of "parked item N" matches ``parking-lot list`` exactly.
+    """
+    from parking_lot import _find_parking_lot_bounds, _parse_items
+
+    lines = content.split('\n')
+    start, end = _find_parking_lot_bounds(lines)
+    if start == -1:
+        return None
+    items = _parse_items(lines, start, end)
+    return next((it for it in items if it['id'] == item_id), None)
+
+
+def _promote_parked_onto_board(tasks_file, fmt: str, item_id: int, *, personal: bool):
+    """Capacity-gated move of a parked item onto the active board.
+
+    Returns a result dict ``{ok, message, [exit_code], [title], [summary]}``. The
+    move adds the active line FIRST, then removes the parked line, so a crash
+    between the two writes leaves the task DOUBLE-placed (recoverable) rather than
+    LOST. The capacity gate re-runs ``evaluate_add`` for the to-be-promoted task;
+    a full committed set refuses without moving anything.
+    """
+    from focus_core import evaluate_add
+    from parking_lot import drop_item
+
+    content = tasks_file.read_text()
+    parked = _find_parked_item(content, item_id)
+    if parked is None:
+        return {"ok": False, "message": f"❌ Item #{item_id} not found in Parking Lot.", "exit_code": 2}
+
+    title = parked['title']
+    area = parked.get('department')
+    # Re-derive due/owner/estimate from the self-describing parked line so the
+    # restored active line carries them (H6 Fix 2: a captured task's due date /
+    # owner / estimate are "saved, not lost", not silently dropped on promote).
+    # Without the estimate the re-promoted task would count at the unestimated
+    # default (2h) instead of its real load -- a capacity under-count.
+    due = parked.get('due')
+    owner = parked.get('owner')
+    estimate = parked.get('estimate')
+    # Preserve the parked task's canonical id through the promote so it round-trips
+    # (capture -> promote, swap-out -> promote-in keep one stable identity).
+    id_match = re.search(
+        r'(?:task_id|id)::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])', parked.get('raw_line') or ''
+    )
+    carried_id = id_match.group(1) if id_match else None
+
+    # Promotion gate: re-run the canonical capacity check for THIS task. A personal
+    # board is never work-cap gated (matching add_task's scope decision).
+    destination_active = not personal
+    gate = evaluate_add(content, fmt, title, destination_active=destination_active, personal=personal)
+    if not gate.allowed:
+        summary = gate.summary
+        cap_h = (summary.capacity_minutes // 60) if summary else 0
+        active_n = summary.active_count if summary else 0
+        return {
+            "ok": False,
+            "message": (
+                f"Committed set is full ({active_n} / ~{cap_h}h). "
+                f"/swap <out_id> {item_id} to make room, or /done something first."
+            ),
+            "exit_code": 2,
+        }
+
+    # Add to the active board FIRST (so a crash double-places, never loses).
+    task_line, _ = _build_active_task_line(
+        title, due=due, area=area, owner=owner, task_id=carried_id, estimate=estimate
+    )
+    new_content = _insert_active_task(content, "medium", area, task_line)
+    if new_content is None:
+        return {"ok": False, "message": "⚠️ Could not find a section to promote into.", "exit_code": 2}
+    _atomic_write(tasks_file, new_content)
+
+    # Then remove from the parking lot. drop_item re-reads the file, so it sees the
+    # active task we just added but removes by the parking-lot item id.
+    drop_result = drop_item(tasks_file, item_id)
+    if drop_result.startswith("❌"):
+        # Active add succeeded but the parking removal failed: the task is on the
+        # board (not lost). Surface the partial state honestly.
+        return {
+            "ok": False,
+            "message": (
+                f"⚠️ Promoted '{title}' to the active board, but could not remove the "
+                f"parked copy ({drop_result}). Drop parking item #{item_id} manually."
+            ),
+            "exit_code": 2,
+        }
+    return {"ok": True, "title": title, "summary": gate.summary, "message": f"✅ Promoted '{title}' to the active board."}
+
+
+def promote_task(args):
+    """H6 Fix 2: promote a parked task onto the active board, capacity-gated."""
+    tasks_file, fmt = get_tasks_file(args.personal)
+    if not tasks_file.exists():
+        print(f"❌ Tasks file not found: {tasks_file}")
+        sys.exit(2)
+
+    result = _promote_parked_onto_board(tasks_file, fmt, args.id, personal=args.personal)
+    print(result["message"])
+    if not result["ok"]:
+        sys.exit(result.get("exit_code", 2))
+    _log_promotion_event("task_promoted", title=result["title"], summary=result.get("summary"))
+
+
+def _park_active_task(tasks_file, fmt: str, out_id: str, *, personal: bool):
+    """Move an active board task (by canonical id) INTO the parking lot.
+
+    Returns ``{ok, message, [exit_code], [title]}``. Parks-out by adding the task
+    to the parking lot FIRST, then removing the active line, so a crash between
+    writes double-places (recoverable) rather than loses. Refuses cleanly if
+    ``out_id`` is not an active task on the board.
+    """
+    from parking_lot import add_item
+    from task_lines import remove_task_line
+
+    content = tasks_file.read_text()
+    records = task_records(content, personal=personal, fmt=fmt)
+    target = next(
+        (r for r in active_records(records) if r.canonical_id == out_id and not r.is_objective),
+        None,
+    )
+    if target is None:
+        return {
+            "ok": False,
+            "message": f"❌ '{out_id}' is not an active task on the board.",
+            "exit_code": 2,
+        }
+
+    # Add to the parking lot FIRST (so a crash double-places, never loses). Preserve
+    # the task's canonical id so the parked copy keeps its identity, and carry the
+    # due date / owner / estimate onto the parked line so a swap-out is also "saved,
+    # not lost" and a later promote-in restores them (H6 Fix 2). The estimate matters
+    # for capacity: without it a re-promoted task under-counts at the unestimated
+    # default. ``estimate`` is read from the SAME parsed active record as due/owner.
+    add_result = add_item(
+        tasks_file, target.title, dept=target.department or target.area,
+        priority="low", task_id=target.canonical_id,
+        due=target.due, owner=target.owner, estimate=target.estimate,
+    )
+    if add_result.startswith("❌"):
+        return {"ok": False, "message": add_result, "exit_code": 2}
+
+    # Then remove the active line. The parking add may have shifted line numbers
+    # (e.g. a parking lot above the active line), so re-derive the active record
+    # from the POST-ADD content by canonical id rather than trusting the stale
+    # line number. The parked copy carries the same id, so exclude it by section.
+    content_after_add = tasks_file.read_text()
+    records_after = task_records(content_after_add, personal=personal, fmt=fmt)
+    active_after = next(
+        (r for r in active_records(records_after) if r.canonical_id == out_id and not r.is_objective),
+        None,
+    )
+    if active_after is None:
+        return {
+            "ok": False,
+            "message": (
+                f"⚠️ Parked '{target.title}' but could not relocate the active copy "
+                f"to remove it. Remove it manually."
+            ),
+            "exit_code": 2,
+        }
+    updated = remove_task_line(content_after_add, active_after.raw_line, active_after.line_number)
+    if updated is None:
+        return {
+            "ok": False,
+            "message": (
+                f"⚠️ Parked '{target.title}' but could not remove the active copy. "
+                f"Remove it manually."
+            ),
+            "exit_code": 2,
+        }
+    _atomic_write(tasks_file, updated)
+    # Resolve the parking-lot item id of the just-parked copy (matched by its
+    # preserved canonical id) so a swap can roll the park-out BACK if needed.
+    parked_id = _parked_item_id_for(updated, out_id)
+    return {
+        "ok": True,
+        "title": target.title,
+        "parked_id": parked_id,
+        "message": f"✅ Parked '{target.title}'.",
+    }
+
+
+def _parked_item_id_for(content: str, canonical_id: str) -> int | None:
+    """Return the parking-lot item id whose line carries ``canonical_id``, or None."""
+    from parking_lot import _find_parking_lot_bounds, _parse_items
+
+    lines = content.split('\n')
+    start, end = _find_parking_lot_bounds(lines)
+    if start == -1:
+        return None
+    for item in _parse_items(lines, start, end):
+        raw = item.get('raw_line') or ''
+        if re.search(rf'(?:task_id|id)::\s*{re.escape(canonical_id)}\b', raw):
+            return item['id']
+    return None
+
+
+def swap_tasks(args):
+    """H6 Fix 3: park out_id (active->parking) AND promote in_id (parking->active).
+
+    All-or-nothing: the FULL post-swap capacity is pre-flighted in memory BEFORE
+    any write, so an unequal swap (where the parked-out task frees less than the
+    promoted-in task needs) is REFUSED cleanly with the board left byte-identical
+    -- never a partial move (out parked, in NOT promoted). Only once the projected
+    state is proven to fit does the park-out (which frees a slot so the
+    promote-in's gate passes) run, followed by the promote-in. A bad out/in id
+    also refuses before any write.
+    """
+    tasks_file, fmt = get_tasks_file(args.personal)
+    if not tasks_file.exists():
+        print(f"❌ Tasks file not found: {tasks_file}")
+        sys.exit(2)
+
+    # Validate BOTH ends before mutating anything: a bad out/in id must not leave a
+    # partial move. out_id must be an active task; in_id must be a parked item.
+    content = tasks_file.read_text()
+    records = task_records(content, personal=args.personal, fmt=fmt)
+    out_target = next(
+        (r for r in active_records(records) if r.canonical_id == args.out_id and not r.is_objective),
+        None,
+    )
+    if out_target is None:
+        print(f"❌ '{args.out_id}' is not an active task on the board. Nothing moved.")
+        sys.exit(2)
+    in_target = _find_parked_item(content, args.in_id)
+    if in_target is None:
+        print(f"❌ Parking item #{args.in_id} not found. Nothing moved.")
+        sys.exit(2)
+
+    # Pre-flight the promote-in insertion against the CURRENT board (a dry-run, no
+    # write). If the parked task has nowhere to land, refuse BEFORE the park-out
+    # write so the swap never leaves a partial board (out parked, nothing in).
+    if _insert_active_task(content, "medium", in_target.get('department'), "- [ ] probe") is None:
+        print("❌ No active section to promote into. Nothing moved.")
+        sys.exit(2)
+
+    # Pre-flight the FULL post-swap CAPACITY in memory (no write): would the board
+    # fit AFTER out_id is removed AND in_id is promoted in? Project the state by
+    # removing out_id's active line and SPLICING IN the in-task's real active line
+    # (carrying its preserved estimate), then summarise that projected board with
+    # the canonical capacity layer and check over_cap. The cap's COUNTING is
+    # unchanged -- this only asks the existing summarizer about a projected state.
+    # Using the in-task's REAL estimate (not the unestimated default) keeps an
+    # estimated parked-out task from being silently promoted back over capacity.
+    # If it would NOT fit, refuse cleanly and leave the board BYTE-IDENTICAL.
+    if not args.personal:
+        from focus_core import summarize_capacity
+
+        projected = remove_task_line(content, out_target.raw_line, out_target.line_number)
+        if projected is not None:
+            probe_line, _ = _build_active_task_line(
+                in_target["title"], due=in_target.get("due"),
+                area=in_target.get("department"), owner=in_target.get("owner"),
+                estimate=in_target.get("estimate"),
+            )
+            projected_with_in = _insert_active_task(
+                projected, "medium", in_target.get("department"), probe_line
+            )
+            over_cap = False
+            if projected_with_in is not None:
+                try:
+                    over_cap = summarize_capacity(
+                        task_records(projected_with_in, personal=args.personal, fmt=fmt)
+                    ).over_cap
+                except Exception:
+                    over_cap = False
+            if over_cap:
+                print(
+                    f"❌ Swap won't fit: '{in_target['title']}' needs more room than "
+                    f"'{out_target.title}' frees. /done another task first, or pick a "
+                    f"smaller task. Nothing moved."
+                )
+                sys.exit(2)
+
+    # Park out FIRST -- this frees a committed slot so the promotion gate passes.
+    park_result = _park_active_task(tasks_file, fmt, args.out_id, personal=args.personal)
+    if not park_result["ok"]:
+        print(park_result["message"])
+        sys.exit(park_result.get("exit_code", 2))
+
+    promote_result = _promote_parked_onto_board(tasks_file, fmt, args.in_id, personal=args.personal)
+    if not promote_result["ok"]:
+        # Belt-and-suspenders: the capacity pre-flight already proved the post-swap
+        # state fits, so this should not fire. If it somehow does, roll the park-out
+        # BACK by promoting the parked-out task onto the active board so the swap
+        # never leaves a partial board (out parked, nothing in).
+        parked_id = park_result.get("parked_id")
+        rollback = (
+            _promote_parked_onto_board(tasks_file, fmt, parked_id, personal=args.personal)
+            if parked_id is not None
+            else None
+        )
+        if rollback is None or not rollback.get("ok"):
+            print(park_result["message"])
+        print(promote_result["message"])
+        sys.exit(promote_result.get("exit_code", 2))
+
+    print(f"✅ Swapped: parked '{park_result['title']}', promoted '{promote_result['title']}'.")
+    _log_promotion_event(
+        "task_swapped",
+        title=promote_result["title"],
+        summary=promote_result.get("summary"),
+        extra={"parked_out": park_result["title"], "out_id": args.out_id, "in_id": args.in_id},
+    )
+
+
+def done_task(args):
+    """Complete a task by canonical ID only."""
+    query = args.query.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", query):
+        print_result(block_unsafe_query(args.query))
+        sys.exit(2)
+
+    result = complete_by_id(query, personal=args.personal, source="user_command")
+    print_result(result)
+    if not result.get("ok"):
+        sys.exit(2)
+
+
+def revert_task(args):
+    """Revert a completion by completion_id only."""
+    completion_id = args.completion_id.strip()
+    if not COMPLETION_ID_RE.fullmatch(completion_id):
+        print_result(
+            {
+                "ok": False,
+                "action": "revert",
+                "reason": "unsafe-completion-id",
+                "message": "Completion undo requires a completion_id.",
+                "error": {
+                    "code": "unsafe-completion-id",
+                    "message": "Completion undo requires a completion_id.",
+                    "query": args.completion_id,
+                },
+            }
+        )
+        sys.exit(2)
+
+    result = revert_completion(completion_id, personal=args.personal)
+    result.setdefault("action", "revert")
+    if result.get("ok"):
+        result.setdefault("reason", "reverted")
+        result.setdefault("message", f"Completion {completion_id} reverted.")
+    else:
+        error = result.get("error") or {}
+        result.setdefault("reason", error.get("code") or "revert-failed")
+        result.setdefault("message", error.get("message") or "Completion could not be reverted.")
+    print_result(result)
+    if not result.get("ok"):
+        sys.exit(2)
+
+
+def capture_task(args):
+    """Capture a chat-stated completion as candidate evidence."""
+    from chat_capture import capture_text
+
+    if args.personal:
+        print_result(
+            {
+                "ok": False,
+                "action": "refused",
+                "error": {
+                    "code": "personal-capture-refused",
+                    "message": (
+                        "capture refuses --personal; the gateway wrapper pins board "
+                        "scope per channel."
+                    ),
+                },
+            }
+        )
+        sys.exit(2)
+
+    result = capture_text(
+        args.text,
+        sender=args.sender,
+        source=args.source,
+        channel=args.channel,
+        message_id=args.message_id,
+        personal=args.personal,
+    )
+    print_result(result)
+    if not result.get("ok"):
+        sys.exit(2)
+
+
+def remove_task(args):
+    """Cancel/remove a task by canonical ID only."""
+    query = args.query.strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]+", query):
+        print_result(block_unsafe_query(args.query))
+        sys.exit(2)
+
+    result = cancel_by_id(query, personal=args.personal, source="user_command")
+    print_result(result)
+    if not result.get("ok"):
+        sys.exit(2)
+
+
+def cmd_rollover(args):
+    """Regenerate the weekly board as one canonical open-task list."""
+    tasks_file, _ = get_tasks_file(args.personal)
+    result = run_rollover(
+        personal=args.personal,
+        target_date=args.date,
+        dry_run=args.dry_run,
+    )
+    if args.dry_run:
+        print(result.content, end="")
+        return
+    print_result(result.payload(tasks_file=tasks_file))
 
 
 def show_blockers(args):
@@ -534,10 +1049,12 @@ def archive_done(args):
     removed = 0
     if stale_board and tasks_file.exists():
         board_content = tasks_file.read_text()
-        for task in stale_board:
+        for task in sorted(stale_board, key=lambda t: t.get('line_number') or 0, reverse=True):
             raw_line = task.get('raw_line', '')
-            if raw_line and raw_line in board_content:
-                board_content = _remove_task_line(board_content, raw_line)
+            line_number = task.get('line_number')
+            updated = remove_task_line(board_content, raw_line, line_number)
+            if updated is not None:
+                board_content = updated
                 removed += 1
         tasks_file.write_text(board_content)
 
@@ -591,7 +1108,8 @@ def cmd_delegated(args):
             tasks_file, _ = get_tasks_file(personal=False)
             content = tasks_file.read_text()
             dept_tag = f" #{item.get('department')}" if item.get('department') else ''
-            task_line = f"- [ ] **{item['title']}**{dept_tag}"
+            task_id = f"tsk_{uuid.uuid4().hex[:16]}"
+            task_line = f"- [ ] **{item['title']}** task_id::{task_id}{dept_tag}"
             # Insert at beginning of first section
             lines = content.split('\n')
             insert_at = 0
@@ -633,72 +1151,29 @@ def cmd_parking_lot(args):
         print(drop_item(tasks_file, args.id, archive_dir=archive_dir))
 
 
-def _find_open_task(personal: bool, query: str) -> tuple[Path, dict | None, str]:
-    tasks_file, fmt = get_tasks_file(personal)
-    if not tasks_file.exists():
-        return tasks_file, None, f"❌ Tasks file not found: {tasks_file}"
-    content = tasks_file.read_text()
-    tasks_data = parse_tasks(content, personal, fmt)
-    matches = [t for t in tasks_data.get('all', []) if not t.get('done') and query.lower() in t.get('title', '').lower()]
-    if not matches:
-        return tasks_file, None, f"❌ No open task matches: {query}"
-    if len(matches) > 1:
-        return tasks_file, None, f"❌ Multiple matches for '{query}'. Be more specific."
-    return tasks_file, matches[0], ""
+def cmd_identity_audit(args):
+    print_identity_json(audit_payload(personal=args.personal))
 
 
-def cmd_state(args):
-    """First-class state transitions: pause/delegate/backlog/drop."""
-    from parking_lot import add_item
+def cmd_task_audit(args):
+    payload = _new_schema("task-audit")
+    payload.update(
+        collect_task_audit(
+            personal=args.personal,
+            stale_days=args.stale_days if args.stale_days is not None else _env_int("TASK_AUDIT_STALE_DAYS", 14),
+            candidate_days=args.candidate_days if args.candidate_days is not None else _env_int("TASK_AUDIT_CANDIDATE_DAYS", 7),
+            backlog_cap=args.backlog_cap,
+            limit=args.limit,
+        )
+    )
+    print(json.dumps(payload, indent=2))
 
-    tasks_file, task, err = _find_open_task(args.personal, args.query)
-    if err:
-        print(err)
-        return
 
-    content = tasks_file.read_text()
-    old_line = task.get('raw_line', '')
-    if not old_line:
-        print("❌ Task has no raw line; cannot transition.")
-        return
-
-    if args.state_command == 'pause':
-        new_line = old_line if 'paused::' in old_line else f"{old_line} paused::{datetime.now().date().isoformat()}"
-        if args.until:
-            if 'pause_until::' in new_line:
-                new_line = re.sub(r'pause_until::\d{4}-\d{2}-\d{2}', f'pause_until::{args.until}', new_line)
-            else:
-                new_line = f"{new_line} pause_until::{args.until}"
-        tasks_file.write_text(content.replace(old_line, new_line, 1))
-        print(f"✅ Paused: {task['title']}")
-        return
-
-    if args.state_command == 'delegate':
-        item = delegation.add_item(delegation.resolve_delegation_file(), task['title'], args.to, args.followup, task.get('department'))
-        tasks_file.write_text(_remove_task_line(content, old_line))
-        print(f"✅ Delegated: {item['title']} → {item['assignee']} [followup::{item['followup']}]")
-        return
-
-    if args.state_command == 'backlog':
-        pri = args.priority or task.get('priority') or 'low'
-        msg = add_item(tasks_file, task['title'], dept=args.dept or task.get('department'), priority=pri)
-        if not msg.startswith('✅'):
-            print(f"❌ Backlog move failed: {msg}", file=sys.stderr)
-            return
-        tasks_file.write_text(_remove_task_line(tasks_file.read_text(), old_line))
-        print(f"✅ Backlog: {task['title']} ({msg})")
-        return
-
-    if args.state_command == 'drop':
-        archive_dir = Path(os.getenv('TASK_TRACKER_ARCHIVE_DIR', str(tasks_file.parent / 'Done Archive')))
-        archive_dir.mkdir(parents=True, exist_ok=True)
-        archive_file = archive_dir / f"ARCHIVE-{get_current_quarter()}.md"
-        entry = f"- [x] ~~{task['title']}~~ (dropped) ✅ {datetime.now().date().isoformat()}\n"
-        with archive_file.open('a', encoding='utf-8') as fh:
-            fh.write(entry)
-        tasks_file.write_text(_remove_task_line(content, old_line))
-        print(f"✅ Dropped: {task['title']}")
-        return
+def cmd_identity_repair(args):
+    payload = repair_missing_ids(personal=args.personal, apply=args.apply)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    if payload.get("blocked"):
+        sys.exit(2)
 
 
 def cmd_promote_from_backlog(args):
@@ -899,89 +1374,6 @@ def _safe_load_tasks(personal: bool = False) -> dict:
         return empty
 
 
-def _normalize_title(title: str) -> str:
-    lowered = (title or "").strip().casefold()
-    lowered = re.sub(r"\[x\]|\[ \]|✅|☑️", " ", lowered)
-    lowered = re.sub(r"\*\*|__|~~", "", lowered)
-    lowered = re.sub(r"[^\w\s/-]", " ", lowered)
-    lowered = re.sub(r"\s+", " ", lowered)
-    return lowered.strip()
-
-
-def _slugify(value: str) -> str:
-    normalized = _normalize_title(value)
-    slug = re.sub(r"[^a-z0-9]+", "-", normalized)
-    slug = re.sub(r"-{2,}", "-", slug).strip("-")
-    return slug or "task"
-
-
-def _extract_inline_identifiers(text: str) -> dict[str, set[str]]:
-    exact_identifiers: set[str] = set()
-    fallback_identifiers: set[str] = set()
-    if not text:
-        return {"exact": exact_identifiers, "fallback": fallback_identifiers}
-
-    for match in re.findall(r"\b(?:id|task_id|task)::([A-Za-z0-9._:-]+)", text, flags=re.IGNORECASE):
-        exact_identifiers.add(match.casefold())
-
-    for url in re.findall(r"https?://[^\s)>\]]+", text):
-        lowered_url = url.casefold()
-        exact_identifiers.add(lowered_url)
-        github_issue_match = re.search(
-            r"^https?://(?:www\.)?github\.com/([^/\s]+)/([^/\s]+)/issues/(\d+)\b",
-            lowered_url,
-        )
-        if github_issue_match:
-            owner, repo, issue_num = github_issue_match.groups()
-            exact_identifiers.add(f"gh:{owner}/{repo}#{issue_num}")
-            fallback_identifiers.add(f"gh-issue-num:{issue_num}")
-
-    for match in re.findall(r"\b#(\d+)\b", text):
-        fallback_identifiers.add(f"gh-issue-num:{match}")
-
-    return {"exact": exact_identifiers, "fallback": fallback_identifiers}
-
-
-def _task_identifier_bundle(task: dict, fallback_id: str) -> dict:
-    raw_line = str(task.get("raw_line") or "")
-    title = str(task.get("title") or "")
-    explicit_id = None
-    explicit_match = re.search(
-        r"\b(?:id|task_id|task)::([A-Za-z0-9._:-]+)",
-        raw_line,
-        flags=re.IGNORECASE,
-    )
-    if explicit_match:
-        explicit_id = explicit_match.group(1)
-
-    raw_identifiers = _extract_inline_identifiers(raw_line)
-    title_identifiers = _extract_inline_identifiers(title)
-    exact_identifiers = raw_identifiers["exact"] | title_identifiers["exact"]
-    fallback_identifiers = raw_identifiers["fallback"] | title_identifiers["fallback"]
-    if explicit_id:
-        exact_identifiers.add(explicit_id.casefold())
-
-    return {
-        "task_id": explicit_id or fallback_id,
-        "exact_identifiers": exact_identifiers,
-        "fallback_identifiers": fallback_identifiers,
-    }
-
-
-def _canonical_task(task: dict, task_id: str) -> dict:
-    return {
-        "task_id": task_id,
-        "title": task.get("title", ""),
-        "done": bool(task.get("done")),
-        "section": task.get("section"),
-        "area": task.get("area") or task.get("department") or "Uncategorized",
-        "priority": task.get("priority"),
-        "due": task.get("due"),
-        "owner": task.get("owner"),
-        "goal": task.get("goal"),
-    }
-
-
 def _group_tasks_by_area(tasks: list[dict]) -> dict[str, list[dict]]:
     grouped: dict[str, list[dict]] = {}
     for task in tasks:
@@ -1034,175 +1426,9 @@ def _parse_range_inputs(week: str | None, start_raw: str | None, end_raw: str | 
     return start_date, start_date + timedelta(days=6), "iso-week"
 
 
-def _extract_done_lines(content: str) -> list[dict]:
-    parsed: list[dict] = []
-    for raw in content.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-
-        is_checkbox = bool(re.match(r"^\s*[-*+]\s+\[(?:x|X| )\]\s+", raw))
-        is_checked = bool(re.match(r"^\s*[-*+]\s+\[(?:x|X)\]\s+", raw))
-
-        is_plain_bullet = bool(re.match(r"^\s*[-*+]\s+", raw))
-        if is_checkbox and not is_checked:
-            continue
-        if not is_checkbox and not is_plain_bullet and not line.startswith("✅"):
-            # Plain lines are accepted as completed actions too.
-            pass
-
-        cleaned = re.sub(r"^\s*[-*+]\s+", "", raw).strip()
-        cleaned = re.sub(r"^\[(?:x|X| )\]\s+", "", cleaned)
-        cleaned = re.sub(r"^\d{1,2}:\d{2}(?::\d{2})?\s+", "", cleaned)
-        cleaned = re.sub(r"^✅\s*", "", cleaned)
-        cleaned = re.sub(r"\s*✅\s*\d{4}-\d{2}-\d{2}\s*$", "", cleaned)
-        cleaned = cleaned.strip()
-        if not cleaned:
-            continue
-
-        identifiers = _extract_inline_identifiers(cleaned)
-        parsed.append(
-            {
-                "raw_line": raw.rstrip("\n"),
-                "title": cleaned,
-                "normalized_title": _normalize_title(cleaned),
-                "exact_identifiers": identifiers["exact"],
-                "fallback_identifiers": identifiers["fallback"],
-            }
-        )
-    return parsed
-
-
-def _fuzzy_score(left: str, right: str) -> float:
-    if not left or not right:
-        return 0.0
-    return SequenceMatcher(None, left, right).ratio()
-
-
-def _build_task_catalog(tasks_data: dict) -> list[dict]:
-    catalog: list[dict] = []
-    for idx, task in enumerate(tasks_data.get("all", []), start=1):
-        fallback_id = f"{_slugify(task.get('title', 'task'))}-{idx:03d}"
-        bundle = _task_identifier_bundle(task, fallback_id=fallback_id)
-        canonical = _canonical_task(task, bundle["task_id"])
-        catalog.append(
-            {
-                "task": task,
-                "canonical": canonical,
-                "normalized_title": _normalize_title(canonical["title"]),
-                "exact_identifiers": bundle["exact_identifiers"],
-                "fallback_identifiers": bundle["fallback_identifiers"],
-            }
-        )
-    return catalog
-
-
-def _task_id_lookup(tasks_data: dict) -> dict[int, str]:
-    lookup: dict[int, str] = {}
-    for entry in _build_task_catalog(tasks_data):
-        lookup[id(entry["task"])] = entry["canonical"]["task_id"]
-    return lookup
-
-
-def _canonical_task_with_lookup(task: dict, task_ids: dict[int, str]) -> dict:
-    fallback_id = _slugify(task.get("title", ""))
-    return _canonical_task(task, task_ids.get(id(task), fallback_id))
-
-
-def _ingest_match_line(
-    line: dict,
-    catalog: list[dict],
-    auto_threshold: float,
-    review_threshold: float,
-) -> dict:
-    exact_matches = [
-        candidate
-        for candidate in catalog
-        if line["exact_identifiers"] and (line["exact_identifiers"] & candidate["exact_identifiers"])
-    ]
-    if exact_matches:
-        chosen = sorted(exact_matches, key=lambda c: c["canonical"]["task_id"])[0]
-        return {
-            "raw_line": line["raw_line"],
-            "parsed_title": line["title"],
-            "normalized_title": line["normalized_title"],
-            "canonical_task": chosen["canonical"],
-            "match_metadata": {
-                "matched_task_id": chosen["canonical"]["task_id"],
-                "score": 1.0,
-                "decision": "auto-link",
-                "match_type": "exact-id-or-link",
-            },
-        }
-
-    fallback_matches = [
-        candidate
-        for candidate in catalog
-        if line["fallback_identifiers"] and (line["fallback_identifiers"] & candidate["fallback_identifiers"])
-    ]
-    if fallback_matches:
-        chosen = sorted(fallback_matches, key=lambda c: c["canonical"]["task_id"])[0]
-        return {
-            "raw_line": line["raw_line"],
-            "parsed_title": line["title"],
-            "normalized_title": line["normalized_title"],
-            "canonical_task": chosen["canonical"],
-            "match_metadata": {
-                "matched_task_id": chosen["canonical"]["task_id"],
-                "score": 0.6,
-                "decision": "needs-review",
-                "match_type": "issue-number-fallback",
-            },
-        }
-
-    exact_title_matches = [
-        candidate for candidate in catalog if candidate["normalized_title"] == line["normalized_title"]
-    ]
-    if exact_title_matches:
-        chosen = sorted(exact_title_matches, key=lambda c: c["canonical"]["task_id"])[0]
-        return {
-            "raw_line": line["raw_line"],
-            "parsed_title": line["title"],
-            "normalized_title": line["normalized_title"],
-            "canonical_task": chosen["canonical"],
-            "match_metadata": {
-                "matched_task_id": chosen["canonical"]["task_id"],
-                "score": 1.0,
-                "decision": "auto-link",
-                "match_type": "normalized-title",
-            },
-        }
-
-    scored = []
-    for candidate in catalog:
-        score = _fuzzy_score(line["normalized_title"], candidate["normalized_title"])
-        scored.append((score, candidate["canonical"]["task_id"], candidate))
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    best_score, _, best = scored[0] if scored else (0.0, "", None)
-
-    decision = "no-match"
-    if best and best_score >= auto_threshold:
-        decision = "auto-link"
-    elif best and best_score >= review_threshold:
-        decision = "needs-review"
-
-    return {
-        "raw_line": line["raw_line"],
-        "parsed_title": line["title"],
-        "normalized_title": line["normalized_title"],
-        "canonical_task": best["canonical"] if best and decision != "no-match" else None,
-        "match_metadata": {
-            "matched_task_id": best["canonical"]["task_id"] if best and decision != "no-match" else None,
-            "score": round(float(best_score), 4),
-            "decision": decision,
-            "match_type": "fuzzy",
-        },
-    }
-
-
 def cmd_standup_summary(args):
     tasks_data = _safe_load_tasks(args.personal)
-    task_ids = _task_id_lookup(tasks_data)
+    records = _safe_load_task_records(args.personal)
     today = datetime.now().date()
 
     notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
@@ -1229,34 +1455,56 @@ def cmd_standup_summary(args):
             for task in tasks_data.get("done", [])
         ]
 
-    dos_raw = [
-        task
-        for task in tasks_data.get("all", [])
-        if not task.get("done") and task.get("section") in {"q1", "q2", "today"}
-    ]
-    dos = [_canonical_task_with_lookup(task, task_ids) for task in dos_raw]
+    active = active_records(records)
+    dos_records = [record for record in active if record.section in {"q1", "q2", "today"}]
+    dos = [_canonical_record(record) for record in dos_records]
 
-    overdue_raw = []
-    for task in tasks_data.get("all", []):
-        if task.get("done") or not task.get("due"):
+    # Layer-2 capacity ceiling (U3): surface the active-inventory load against
+    # ~1 week of capacity so the /standup consumer can show the cap state. The
+    # cap governs the WORK board only (the knobs are sized for the work
+    # inventory), so it is omitted for personal standups -- matching the
+    # work-only standup.py entrypoint.
+    capacity = None
+    if not args.personal:
+        try:
+            from focus_core import capacity_display, summarize_capacity
+            capacity_summary = summarize_capacity(records)
+            capacity = {
+                "active_count": capacity_summary.active_count,
+                "estimated_minutes": capacity_summary.estimated_minutes,
+                "capacity_minutes": capacity_summary.capacity_minutes,
+                "hard_cap": capacity_summary.hard_cap,
+                "over_cap": capacity_summary.over_cap,
+                "display": capacity_display(capacity_summary),
+            }
+        except Exception:
+            capacity = None
+
+    overdue_records = []
+    for record in active:
+        if not record.due:
             continue
         try:
-            due_date = datetime.strptime(task.get("due"), "%Y-%m-%d").date()
+            due_date = datetime.strptime(record.due, "%Y-%m-%d").date()
         except ValueError:
             continue
         if due_date < today:
-            overdue_raw.append(task)
-    overdue = [_canonical_task_with_lookup(task, task_ids) for task in overdue_raw]
+            overdue_records.append(record)
+    overdue = [_canonical_record(record) for record in overdue_records]
 
     carryover_suggestions = []
-    for task in overdue_raw:
+    for record in overdue_records:
         carryover_suggestions.append(
             {
-                "title": task.get("title", ""),
+                "task_id": record.canonical_id,
+                "fallback_id": record.fallback_id,
+                "missing_task_id": record.missing_task_id,
+                "fallback_only": record.fallback_only,
+                "title": record.title,
                 "reason": "overdue",
                 "suggestion": "carry-to-today",
-                "due": task.get("due"),
-                "area": task.get("area") or task.get("department") or "Uncategorized",
+                "due": record.due,
+                "area": record.area or record.department or "Uncategorized",
             }
         )
 
@@ -1268,7 +1516,10 @@ def cmd_standup_summary(args):
             "dones": dones,
             "dos": dos,
             "overdue": overdue,
+            "capacity": capacity,
             "carryover_suggestions": carryover_suggestions,
+            "completion_candidates": candidate_review_summary(personal=args.personal),
+            "task_audit": task_audit_summary(personal=args.personal),
             "groups": {
                 "dones_by_area": _group_tasks_by_area(dones),
                 "dos_by_area": _group_tasks_by_area(dos),
@@ -1288,7 +1539,7 @@ def cmd_weekly_review_summary(args):
         sys.exit(2)
 
     tasks_data = _safe_load_tasks(args.personal)
-    task_ids = _task_id_lookup(tasks_data)
+    records = _safe_load_task_records(args.personal)
     notes_dir_raw = os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
 
     done_items: list[dict] = []
@@ -1319,15 +1570,31 @@ def cmd_weekly_review_summary(args):
             except ValueError:
                 continue
             if start_date <= completed_date <= end_date:
-                row = _canonical_task_with_lookup(task, task_ids)
+                matching = [
+                    record for record in records
+                    if record.line_number == task.get("line_number")
+                    and record.raw_line == task.get("raw_line")
+                ]
+                row = _canonical_record(matching[0]) if matching else {
+                    "task_id": task.get("task_id") or task.get("legacy_id"),
+                    "fallback_id": None,
+                    "missing_task_id": task.get("task_id") is None,
+                    "fallback_only": not (task.get("task_id") or task.get("legacy_id")),
+                    "title": task.get("title", ""),
+                    "done": bool(task.get("done")),
+                    "section": task.get("section"),
+                    "area": task.get("area") or task.get("department") or "Uncategorized",
+                    "priority": task.get("priority"),
+                    "due": task.get("due"),
+                    "owner": task.get("owner"),
+                    "goal": task.get("goal"),
+                }
                 row["completed_date"] = completed
                 done_items.append(row)
 
     do_items = []
-    for task in tasks_data.get("all", []):
-        if task.get("done"):
-            continue
-        due_raw = task.get("due")
+    for record in active_records(records):
+        due_raw = record.due
         if due_raw:
             try:
                 due_date = datetime.strptime(due_raw, "%Y-%m-%d").date()
@@ -1335,7 +1602,36 @@ def cmd_weekly_review_summary(args):
                 continue
             if due_date < start_date or due_date > end_date:
                 continue
-        do_items.append(_canonical_task_with_lookup(task, task_ids))
+        do_items.append(_canonical_record(record))
+
+    if not records:
+        for task in tasks_data.get("all", []):
+            if task.get("done"):
+                continue
+            due_raw = task.get("due")
+            if due_raw:
+                try:
+                    due_date = datetime.strptime(due_raw, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if due_date < start_date or due_date > end_date:
+                    continue
+            do_items.append(
+                {
+                    "task_id": task.get("task_id") or task.get("legacy_id"),
+                    "fallback_id": None,
+                    "missing_task_id": task.get("task_id") is None,
+                    "fallback_only": not (task.get("task_id") or task.get("legacy_id")),
+                    "title": task.get("title", ""),
+                    "done": False,
+                    "section": task.get("section"),
+                    "area": task.get("area") or task.get("department") or "Uncategorized",
+                    "priority": task.get("priority"),
+                    "due": task.get("due"),
+                    "owner": task.get("owner"),
+                    "goal": task.get("goal"),
+                }
+            )
 
     payload = _new_schema("weekly-review-summary")
     payload.update(
@@ -1356,6 +1652,8 @@ def cmd_weekly_review_summary(args):
                 "by_area": _group_tasks_by_area(do_items),
                 "by_category": _group_tasks_by_category(do_items),
             },
+            "completion_candidates": candidate_review_summary(personal=args.personal),
+            "task_audit": task_audit_summary(personal=args.personal),
         }
     )
     print(json.dumps(payload, indent=2))
@@ -1384,9 +1682,9 @@ def cmd_ingest_daily_log(args):
         source_content = sys.stdin.read()
         source = {"type": "stdin"}
 
-    parsed_lines = _extract_done_lines(source_content)
-    tasks_data = _safe_load_tasks(args.personal)
-    catalog = _build_task_catalog(tasks_data)
+    parsed_lines = extract_done_lines(source_content)
+    records = _safe_load_task_records(args.personal)
+    catalog = build_task_catalog(records)
     auto_threshold = float(args.auto_threshold)
     review_threshold = float(args.review_threshold)
     if review_threshold > auto_threshold:
@@ -1394,11 +1692,11 @@ def cmd_ingest_daily_log(args):
         sys.exit(2)
 
     matched = [
-        _ingest_match_line(line, catalog, auto_threshold=auto_threshold, review_threshold=review_threshold)
+        match_evidence_line(line, catalog, auto_threshold=auto_threshold, review_threshold=review_threshold)
         for line in parsed_lines
     ]
 
-    counts = {"auto-link": 0, "needs-review": 0, "no-match": 0}
+    counts = {"evidence-link": 0, "needs-review": 0, "no-match": 0}
     for item in matched:
         counts[item["match_metadata"]["decision"]] += 1
 
@@ -1407,13 +1705,13 @@ def cmd_ingest_daily_log(args):
         {
             "source": source,
             "thresholds": {
-                "auto_link": auto_threshold,
+                "evidence_link": auto_threshold,
                 "needs_review": review_threshold,
             },
             "totals": {
                 "input_lines": len(source_content.splitlines()),
                 "parsed_done_lines": len(parsed_lines),
-                "auto_linked": counts["auto-link"],
+                "evidence_linked": counts["evidence-link"],
                 "needs_review": counts["needs-review"],
                 "no_match": counts["no-match"],
             },
@@ -1421,6 +1719,190 @@ def cmd_ingest_daily_log(args):
         }
     )
     print(json.dumps(payload, indent=2))
+
+
+def _candidate_payload(command: str, **fields) -> dict:
+    payload = _new_schema(command)
+    payload.update(fields)
+    return payload
+
+
+def _print_candidate_result(result: dict, *, command: str, exit_on_error: bool = True) -> None:
+    if "schema_version" not in result:
+        result = _candidate_payload(command, **result)
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if exit_on_error and result.get("ok") is False:
+        sys.exit(2)
+
+
+def _visible_completion_candidates(candidates: list[dict], *, include_all: bool = False) -> list[dict]:
+    if include_all:
+        return candidates
+    today = date.today().isoformat()
+    return [
+        candidate for candidate in candidates
+        if candidate.get("status") != "snoozed"
+        or (candidate.get("snoozed_until") or "") <= today
+    ]
+
+
+def cmd_completion_candidates(args):
+    from completion_candidates import (
+        confirm_candidate,
+        duplicate_candidate,
+        get_candidate,
+        mark_shown,
+        project_candidates,
+        reject_candidate,
+        scan_content,
+        scan_daily_note,
+        scan_file,
+        snooze_candidate,
+    )
+    from task_ledger import MalformedLedgerError
+
+    try:
+        if args.candidate_command == "scan":
+            if args.file and args.date:
+                _print_candidate_result(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "conflicting-scan-sources",
+                            "message": "Use either --file or --date, not both.",
+                        },
+                    },
+                    command="completion-candidates scan",
+                )
+                return
+            if args.file:
+                result = scan_file(Path(args.file), personal=args.personal)
+                _print_candidate_result(result, command="completion-candidates scan", exit_on_error=False)
+                return
+            if args.date:
+                notes_dir_raw = args.notes_dir or os.getenv("TASK_TRACKER_DAILY_NOTES_DIR")
+                if not notes_dir_raw:
+                    _print_candidate_result(
+                        {"ok": False, "error": {"code": "daily-notes-dir-required"}},
+                        command="completion-candidates scan",
+                    )
+                    return
+                notes_dir = Path(notes_dir_raw).expanduser()
+                day = datetime.strptime(args.date, "%Y-%m-%d").date()
+                result = scan_daily_note(notes_dir, day, personal=args.personal)
+                _print_candidate_result(
+                    result,
+                    command="completion-candidates scan",
+                    exit_on_error=False,
+                )
+                return
+            content = sys.stdin.read()
+            result = scan_content(content, {"type": "stdin"}, personal=args.personal)
+            _print_candidate_result(
+                result,
+                command="completion-candidates scan",
+                exit_on_error=False,
+            )
+            return
+
+        if args.candidate_command == "list":
+            candidates = _visible_completion_candidates(
+                project_candidates(include_terminal=args.all, personal=args.personal),
+                include_all=args.all,
+            )
+            if args.mark_shown:
+                for candidate in candidates:
+                    if candidate.get("status") == "new":
+                        mark_shown(candidate["candidate_id"], personal=args.personal)
+                candidates = _visible_completion_candidates(
+                    project_candidates(include_terminal=args.all, personal=args.personal),
+                    include_all=args.all,
+                )
+            _print_candidate_result(
+                {"candidates": candidates, "total": len(candidates)},
+                command="completion-candidates list",
+                exit_on_error=False,
+            )
+            return
+
+        if args.candidate_command == "show":
+            candidate = get_candidate(args.candidate_id, include_terminal=True, personal=args.personal)
+            if candidate is None:
+                _print_candidate_result(
+                    {"ok": False, "error": {"code": "candidate-not-found"}},
+                    command="completion-candidates show",
+                )
+                return
+            if args.mark_shown and candidate.get("status") == "new":
+                result = mark_shown(args.candidate_id, personal=args.personal)
+                candidate = result.get("candidate")
+            _print_candidate_result(
+                {"candidate": candidate},
+                command="completion-candidates show",
+                exit_on_error=False,
+            )
+            return
+
+        if args.candidate_command == "reject":
+            result = reject_candidate(
+                args.candidate_id,
+                reason=args.reason,
+                personal=args.personal,
+            )
+            _print_candidate_result(result, command="completion-candidates reject")
+            return
+
+        if args.candidate_command == "snooze":
+            result = snooze_candidate(args.candidate_id, until=args.until, personal=args.personal)
+            _print_candidate_result(result, command="completion-candidates snooze")
+            return
+
+        if args.candidate_command == "duplicate":
+            result = duplicate_candidate(
+                args.candidate_id,
+                duplicate_of=args.duplicate_of,
+                personal=args.personal,
+            )
+            _print_candidate_result(result, command="completion-candidates duplicate")
+            return
+
+        if args.candidate_command == "confirm":
+            result = confirm_candidate(
+                args.candidate_id,
+                task_id=args.task_id,
+                personal=args.personal,
+            )
+            _print_candidate_result(result, command="completion-candidates confirm")
+            return
+    except MalformedLedgerError as exc:
+        _print_candidate_result(
+            {
+                "ok": False,
+                "error": {
+                    "code": "malformed-ledger",
+                    "malformed": [
+                        {
+                            "path": item.path,
+                            "line_number": item.line_number,
+                            "message": item.message,
+                            "raw_line": item.raw_line,
+                        }
+                        for item in exc.malformed
+                    ],
+                },
+            },
+            command=f"completion-candidates {args.candidate_command}",
+        )
+    except OSError as exc:
+        _print_candidate_result(
+            {"ok": False, "error": {"code": "io-error", "message": str(exc)}},
+            command=f"completion-candidates {args.candidate_command}",
+        )
+    except ValueError as exc:
+        _print_candidate_result(
+            {"ok": False, "error": {"code": "invalid-input", "message": str(exc)}},
+            command=f"completion-candidates {args.candidate_command}",
+        )
 
 
 def cmd_calendar_sync_primitive(args):
@@ -1435,14 +1917,14 @@ def cmd_calendar_sync_primitive(args):
         warnings.append("calendar-events-unavailable")
 
     try:
-        tasks_data = _safe_load_tasks(args.personal)
-        for task in tasks_data.get("all", []):
-            raw = str(task.get("raw_line") or "")
+        records = _safe_load_task_records(args.personal)
+        for record in records:
+            raw = record.raw_line
             if "meeting::" not in raw:
                 continue
             raw_l = raw.lower()
             status = "scheduled"
-            if task.get("done") or "status::done" in raw_l:
+            if record.done or "status::done" in raw_l:
                 status = "done"
             elif "status::canceled" in raw_l:
                 status = "canceled"
@@ -1451,10 +1933,13 @@ def cmd_calendar_sync_primitive(args):
 
             meetings.append(
                 {
-                    "task_id": _task_identifier_bundle(task, _slugify(task.get("title", "")))["task_id"],
-                    "title": task.get("title", ""),
+                    "task_id": record.canonical_id,
+                    "fallback_id": record.fallback_id,
+                    "missing_task_id": record.missing_task_id,
+                    "fallback_only": record.fallback_only,
+                    "title": record.title,
                     "status": status,
-                    "classification": _calendar_classification(task),
+                    "classification": _calendar_classification(record_to_task_dict(record)),
                 }
             )
     except Exception:
@@ -1514,254 +1999,6 @@ def _format_completion_pct(value: float) -> str:
     return f"{value:.1f}"
 
 
-def _get_full_task_block(content: str, raw_line: str) -> list[str]:
-    """Extract a task line and all its continuation/note lines."""
-    lines = content.split('\n')
-    try:
-        start = lines.index(raw_line)
-    except ValueError:
-        return [raw_line]
-
-    block = [raw_line]
-    target_indent = len(raw_line) - len(raw_line.lstrip(' '))
-    i = start + 1
-    while i < len(lines):
-        line = lines[i]
-        if line.strip() == '':
-            # Peek ahead: if next non-blank line is continuation, include blanks
-            j = i + 1
-            while j < len(lines) and lines[j].strip() == '':
-                j += 1
-            if j < len(lines):
-                next_indent = len(lines[j]) - len(lines[j].lstrip(' '))
-                if next_indent > target_indent:
-                    block.append(line)
-                    i += 1
-                    continue
-            break
-        indent = len(line) - len(line.lstrip(' '))
-        if indent > target_indent:
-            block.append(line)
-            i += 1
-            continue
-        break
-    return block
-
-
-def _find_task_and_file(personal: bool, query: str):
-    """Find a single open task by fuzzy title match. Returns (tasks_file, task, content, error_msg)."""
-    tasks_file, fmt = get_tasks_file(personal)
-    if not tasks_file.exists():
-        return tasks_file, None, '', f"❌ Tasks file not found: {tasks_file}"
-    content = tasks_file.read_text()
-    tasks_data = parse_tasks(content, personal, fmt)
-    matches = [t for t in tasks_data.get('all', [])
-               if not t.get('done') and query.lower() in t.get('title', '').lower()]
-    if not matches:
-        return tasks_file, None, content, f"❌ No open task matches: {query}"
-    if len(matches) > 1:
-        titles = '\n'.join(f'  {i}. {t["title"]}' for i, t in enumerate(matches, 1))
-        return tasks_file, None, content, f"❌ Multiple matches:\n{titles}\nBe more specific."
-    return tasks_file, matches[0], content, ''
-
-
-# Section mapping for move command
-SECTION_MAP = {
-    'high': '## 🔴 High Priority (This Week)',
-    'medium': '## 🟡 Medium Priority (This Week)',
-    'waiting': '## 🟠 Waiting / Delegated',
-    'parking-lot': '## 🅿️ Parking Lot',
-    'backlog': '## ⚪ Backlog',
-}
-
-
-def cmd_move(args):
-    """Move a task between priority sections."""
-    tasks_file, task, content, err = _find_task_and_file(args.personal, args.query)
-    if err:
-        print(err)
-        return
-
-    old_line = task.get('raw_line', '')
-    if not old_line:
-        print("❌ Task has no raw line; cannot move.")
-        return
-
-    target_section = SECTION_MAP[args.to]
-    # Check target section exists in file
-    if target_section not in content:
-        print(f"❌ Target section '{target_section}' not found in tasks file.")
-        return
-
-    # Extract full task block (line + continuation notes)
-    block = _get_full_task_block(content, old_line)
-    block_text = '\n'.join(block)
-
-    # Remove the task block from current position
-    new_content = _remove_task_line(content, old_line)
-    # _remove_task_line already handles continuation lines, but let's be safe
-    # and ensure all block lines are gone
-    for line in block[1:]:
-        if line in new_content:
-            # Remove the line
-            new_content = new_content.replace(line, '', 1)
-    # Clean up double blank lines
-    new_content = re.sub(r'\n{3,}', '\n\n', new_content)
-
-    # Insert after target section header
-    lines = new_content.split('\n')
-    inserted = False
-    for i, line in enumerate(lines):
-        if line.strip() == target_section.strip():
-            # Skip blank lines after header
-            insert_at = i + 1
-            while insert_at < len(lines) and lines[insert_at].strip() == '':
-                insert_at += 1
-            # Insert block lines in reverse at insert_at
-            for bline in reversed(block):
-                lines.insert(insert_at, bline)
-            inserted = True
-            break
-
-    if not inserted:
-        print(f"❌ Could not find insertion point for section '{target_section}'.")
-        return
-
-    tasks_file.write_text('\n'.join(lines))
-    print(f"✅ Moved '{task['title']}' → {args.to}")
-
-
-def cmd_edit(args):
-    """Edit properties of an existing task."""
-    tasks_file, task, content, err = _find_task_and_file(args.personal, args.query)
-    if err:
-        print(err)
-        return
-
-    old_line = task.get('raw_line', '')
-    if not old_line:
-        print("❌ Task has no raw line; cannot edit.")
-        return
-
-    new_line = old_line
-
-    # --title: rename
-    if args.title:
-        old_title = task['title']
-        new_line = new_line.replace(f'**{old_title}**', f'**{args.title}**', 1)
-
-    # --area: replace area tag
-    if args.area:
-        if 'area::' in new_line:
-            new_line = re.sub(r'area::\s*[^\s]+', f'area:: {args.area}', new_line, count=1)
-        else:
-            new_line = f"{new_line.rstrip()} area:: {args.area}"
-
-    # --due: set/update due date
-    if args.due:
-        if '🗓️' in new_line:
-            new_line = re.sub(r'🗓️\d{4}-\d{2}-\d{2}', f'🗓️{args.due}', new_line, count=1)
-        else:
-            # Insert before inline fields or at end
-            inline_field_match = re.search(r'\s+\w+::', new_line)
-            if inline_field_match:
-                pos = inline_field_match.start()
-                new_line = f"{new_line[:pos]} 🗓️{args.due}{new_line[pos:]}"
-            else:
-                new_line = f"{new_line.rstrip()} 🗓️{args.due}"
-
-    # --note: replace note block (indented lines after task line)
-    if args.note:
-        content = content.replace(old_line, new_line, 1)
-        # Remove old note/continuation lines
-        new_content = _remove_task_line(content, new_line)
-        # Re-add just the task line + new note
-        lines = new_content.split('\n')
-        try:
-            idx = lines.index(new_line)
-        except ValueError:
-            # Line was removed by _remove_task_line, re-insert it
-            # Find section and reinsert
-            lines.append(new_line)  # fallback
-            idx = len(lines) - 1
-        for note_line in reversed(args.note.split('\n')):
-            lines.insert(idx + 1, f'  → {note_line}' if not note_line.startswith('  ') else note_line)
-        tasks_file.write_text('\n'.join(lines))
-        print(f"✅ Edited '{task['title']}' (note replaced)")
-        return
-
-    # --append-note: add line to existing notes
-    if args.append_note:
-        content = content.replace(old_line, new_line, 1)
-        block = _get_full_task_block(content, new_line)
-        lines = content.split('\n')
-        # Find the last line of the block
-        last_block_line = block[-1]
-        try:
-            insert_idx = lines.index(last_block_line) + 1
-        except ValueError:
-            insert_idx = lines.index(new_line) + 1
-        note_text = args.append_note
-        note_line = f'  → {note_text}' if not note_text.startswith('  ') else note_text
-        lines.insert(insert_idx, note_line)
-        tasks_file.write_text('\n'.join(lines))
-        print(f"✅ Edited '{task['title']}' (note appended)")
-        return
-
-    # If only inline edits (title, area, due), just replace the line
-    if new_line != old_line:
-        content = content.replace(old_line, new_line, 1)
-        tasks_file.write_text(content)
-        changes = []
-        if args.title:
-            changes.append(f'title→{args.title}')
-        if args.area:
-            changes.append(f'area→{args.area}')
-        if args.due:
-            changes.append(f'due→{args.due}')
-        print(f"✅ Edited '{task['title']}' ({', '.join(changes)})")
-    else:
-        print("⚠️ No changes specified.")
-
-
-def cmd_show(args):
-    """Show full details of a single task."""
-    tasks_file, task, content, err = _find_task_and_file(args.personal, args.query)
-    if err:
-        print(err)
-        return
-
-    # Extract full block including notes
-    raw_line = task.get('raw_line', '')
-    block = _get_full_task_block(content, raw_line) if raw_line else [raw_line]
-
-    # Display structured output
-    title = task.get('title', '(untitled)')
-    section = task.get('section', '—')
-    done = task.get('done', False)
-    area = task.get('area') or '—'
-    due = task.get('due') or '—'
-    owner = task.get('owner') or '—'
-
-    status = '✅ Done' if done else '⬜ Open'
-    print(f"📋 {title}")
-    print(f"   Status:   {status}")
-    print(f"   Section:  {section}")
-    print(f"   Area:     {area}")
-    print(f"   Due:      {due}")
-    print(f"   Owner:    {owner}")
-
-    # Show continuation lines (notes) from block
-    notes = block[1:]  # everything after the task line itself
-    if notes:
-        print(f"   Notes:")
-        for note in notes:
-            print(f"   {note}")
-
-    # Show raw line for debugging
-    print(f"\n   Raw: {raw_line}")
-
-
 def cmd_objectives(args):
     """Show objective-level completion status."""
     content, tasks_data = load_tasks(args.personal)
@@ -1811,9 +2048,9 @@ def main():
     list_parser.add_argument('--status', choices=['open', 'done'])
     list_parser.add_argument('--due', choices=['today', 'this-week', 'overdue', 'due-or-overdue'])
     list_parser.add_argument('--completed-since', choices=['24h', '7d', '30d'])
-    list_parser.add_argument('--area', help='Filter by area tag (partial match)')
-    list_parser.add_argument('--search', help='Full-text search across title and notes')
-    list_parser.add_argument('--plain', action='store_true', help='Plain text output (no markdown table)')
+    list_parser.add_argument('--area', help='Filter by area metadata, partial case-insensitive match')
+    list_parser.add_argument('--search', help='Search task title, raw line, and indented note text')
+    list_parser.add_argument('--plain', action='store_true', help='Use legacy line-by-line output')
     list_parser.set_defaults(func=list_tasks)
     
     # Add command
@@ -1823,21 +2060,102 @@ def main():
     add_parser.add_argument('--due', help='Due date (YYYY-MM-DD)')
     add_parser.add_argument('--owner', default='me')
     add_parser.add_argument('--area', help='Area/category')
-    add_parser.add_argument('--type', dest='task_type', help='Task type/classification metadata')
-    add_parser.add_argument('--estimate', help='Effort/size estimate metadata')
     add_parser.add_argument(
-        '--note-meta',
-        action='append',
-        dest='note_meta',
-        help='Append note:: metadata (repeatable)',
+        '--force-parking',
+        action='store_true',
+        help='Deprecated alias: over-cap adds already route to the parking lot by default (H6)',
     )
     add_parser.set_defaults(func=add_task)
-    
+
+    # Promote command (H6): move a parked task onto the active board, capacity-gated.
+    promote_parser = subparsers.add_parser(
+        'promote',
+        help='Promote a parked task onto the active board (capacity-gated)',
+    )
+    promote_parser.add_argument('id', type=int, help='Parking-lot item id (from parking-lot list)')
+    promote_parser.set_defaults(func=promote_task)
+
+    # Swap command (H6): park an active task and promote a parked one in its place.
+    swap_parser = subparsers.add_parser(
+        'swap',
+        help='Park an active task and promote a parked task into the freed slot',
+    )
+    swap_parser.add_argument('out_id', help='Canonical task_id of the active task to park out')
+    swap_parser.add_argument('in_id', type=int, help='Parking-lot item id to promote in')
+    swap_parser.set_defaults(func=swap_tasks)
+
     # Done command
-    done_parser = subparsers.add_parser('done', help='Mark task as done')
-    done_parser.add_argument('query', help='Task title (fuzzy match)')
+    done_parser = subparsers.add_parser('done', help='Mark task as done by canonical task_id')
+    done_parser.add_argument('query', help='Canonical task_id')
     done_parser.set_defaults(func=done_task)
-    
+
+    revert_parser = subparsers.add_parser('revert', help='Revert a completion by completion_id')
+    revert_parser.add_argument('completion_id', help='Completion id returned by done/auto-complete')
+    revert_parser.set_defaults(func=revert_task)
+
+    capture_parser = subparsers.add_parser(
+        'capture',
+        help=(
+            'Capture a chat-stated completion on the work board. Raw text is '
+            'candidate-only; chat completion writes require a Done button tap.'
+        ),
+    )
+    capture_parser.add_argument('--text', required=True, help='Raw chat statement to stage as a candidate or miss')
+    capture_parser.add_argument(
+        '--sender',
+        help='Sender id recorded for candidate/miss provenance only',
+    )
+    capture_parser.add_argument('--channel', help='Channel recorded for candidate/miss provenance')
+    capture_parser.add_argument('--message-id', help='Message id recorded for candidate/miss provenance')
+    capture_parser.add_argument('--source', default='chat', help='Source label stored on the candidate/miss')
+    capture_parser.set_defaults(func=capture_task)
+
+    # Remove/cancel command
+    remove_parser = subparsers.add_parser(
+        'remove',
+        help='Cancel/remove a task from the board by canonical task_id',
+    )
+    remove_parser.add_argument('query', help='Canonical task_id')
+    remove_parser.set_defaults(func=remove_task)
+
+    rollover_parser = subparsers.add_parser('rollover', help='Regenerate the weekly board deterministically')
+    rollover_parser.add_argument('--date', help='Target date for ISO week header (YYYY-MM-DD)')
+    rollover_parser.add_argument('--dry-run', action='store_true', help='Print result without writing the board')
+    rollover_parser.set_defaults(func=cmd_rollover)
+
+    identity_audit_parser = subparsers.add_parser('identity-audit', help='Read-only canonical identity audit')
+    identity_audit_parser.set_defaults(func=cmd_identity_audit)
+
+    task_audit_parser = subparsers.add_parser('task-audit', help='Read-only task health audit')
+    task_audit_parser.add_argument(
+        '--stale-days',
+        type=int,
+        default=None,
+        help='Days overdue before active tasks are flagged stale',
+    )
+    task_audit_parser.add_argument(
+        '--candidate-days',
+        type=int,
+        default=None,
+        help='Days before unresolved completion candidates are flagged stale',
+    )
+    task_audit_parser.add_argument(
+        '--backlog-cap',
+        type=int,
+        help='Parking Lot cap for backlog pressure checks',
+    )
+    task_audit_parser.add_argument(
+        '--limit',
+        type=int,
+        default=5,
+        help='Maximum findings included in the summary block',
+    )
+    task_audit_parser.set_defaults(func=cmd_task_audit)
+
+    identity_repair_parser = subparsers.add_parser('identity-repair', help='Repair missing task_id metadata')
+    identity_repair_parser.add_argument('--apply', action='store_true', help='Write safe task_id repairs')
+    identity_repair_parser.set_defaults(func=cmd_identity_repair)
+
     done_scan_parser = subparsers.add_parser('done-scan', help='Scan completed items from daily notes')
     done_scan_parser.add_argument('--window', choices=['24h', '7d', '30d'], default='24h')
     done_scan_parser.add_argument('--json', action='store_true')
@@ -1865,14 +2183,14 @@ def main():
 
     ingest_daily_log_parser = subparsers.add_parser(
         'ingest-daily-log',
-        help='Ingest done lines and map to canonical tasks',
+        help='Report done-line evidence links for canonical tasks',
     )
     ingest_daily_log_parser.add_argument('--file', help='Input log file; default is stdin')
     ingest_daily_log_parser.add_argument(
         '--auto-threshold',
         type=float,
-        default=FUZZY_AUTO_LINK_THRESHOLD,
-        help='Fuzzy score threshold for auto-linking',
+        default=FUZZY_EVIDENCE_LINK_THRESHOLD,
+        help='Fuzzy score threshold for evidence-link suggestions',
     )
     ingest_daily_log_parser.add_argument(
         '--review-threshold',
@@ -1881,6 +2199,92 @@ def main():
         help='Fuzzy score threshold for needs-review',
     )
     ingest_daily_log_parser.set_defaults(func=cmd_ingest_daily_log)
+
+    candidates_parser = subparsers.add_parser(
+        'completion-candidates',
+        help='Manage durable completion evidence candidates',
+    )
+    candidates_sub = candidates_parser.add_subparsers(
+        dest='candidate_command',
+        required=True,
+    )
+
+    candidates_scan = candidates_sub.add_parser(
+        'scan',
+        help='Scan done evidence into the candidate inbox',
+    )
+    candidates_scan.add_argument('--file', help='Input log file; default is stdin')
+    candidates_scan.add_argument('--date', help='Daily note date to scan (YYYY-MM-DD)')
+    candidates_scan.add_argument(
+        '--notes-dir',
+        help='Daily notes directory; defaults to TASK_TRACKER_DAILY_NOTES_DIR',
+    )
+    candidates_scan.set_defaults(func=cmd_completion_candidates)
+
+    candidates_list = candidates_sub.add_parser(
+        'list',
+        help='List active completion candidates',
+    )
+    candidates_list.add_argument(
+        '--all',
+        action='store_true',
+        help='Include terminal and future-snoozed candidates',
+    )
+    candidates_list.add_argument(
+        '--mark-shown',
+        action='store_true',
+        help='Record shown events for new listed candidates',
+    )
+    candidates_list.set_defaults(func=cmd_completion_candidates)
+
+    candidates_show = candidates_sub.add_parser(
+        'show',
+        help='Show one completion candidate and its history',
+    )
+    candidates_show.add_argument('candidate_id', help='Candidate ID')
+    candidates_show.add_argument(
+        '--mark-shown',
+        action='store_true',
+        help='Record a shown event for a new candidate',
+    )
+    candidates_show.set_defaults(func=cmd_completion_candidates)
+
+    candidates_confirm = candidates_sub.add_parser(
+        'confirm',
+        help='Confirm a candidate through ID-only completion',
+    )
+    candidates_confirm.add_argument('candidate_id', help='Candidate ID')
+    candidates_confirm.add_argument('--task-id', help='Canonical task_id to complete')
+    candidates_confirm.set_defaults(func=cmd_completion_candidates)
+
+    candidates_reject = candidates_sub.add_parser(
+        'reject',
+        help='Reject a completion candidate',
+    )
+    candidates_reject.add_argument('candidate_id', help='Candidate ID')
+    candidates_reject.add_argument('--reason', help='Optional rejection reason')
+    candidates_reject.set_defaults(func=cmd_completion_candidates)
+
+    candidates_duplicate = candidates_sub.add_parser(
+        'duplicate',
+        help='Mark a candidate as a duplicate of another candidate',
+    )
+    candidates_duplicate.add_argument('candidate_id', help='Candidate ID')
+    candidates_duplicate.add_argument(
+        '--of',
+        dest='duplicate_of',
+        required=True,
+        help='Canonical candidate ID',
+    )
+    candidates_duplicate.set_defaults(func=cmd_completion_candidates)
+
+    candidates_snooze = candidates_sub.add_parser(
+        'snooze',
+        help='Hide a candidate until a future date',
+    )
+    candidates_snooze.add_argument('candidate_id', help='Candidate ID')
+    candidates_snooze.add_argument('--until', required=True, help='Snooze-until date (YYYY-MM-DD)')
+    candidates_snooze.set_defaults(func=cmd_completion_candidates)
 
     calendar_sync_parser = subparsers.add_parser(
         'calendar-sync',
@@ -1914,7 +2318,7 @@ def main():
     objectives_parser.add_argument(
         '--at-risk',
         action='store_true',
-        help='Show only objectives with 0%% completion',
+        help='Show only objectives with 0% completion',
     )
     objectives_parser.set_defaults(func=cmd_objectives)
     
@@ -1969,30 +2373,6 @@ def main():
     del_takeback.add_argument('id', type=int, help='Item ID from list')
     del_takeback.set_defaults(func=cmd_delegated)
 
-    state_parser = subparsers.add_parser('state', help='Transition active task state')
-    state_sub = state_parser.add_subparsers(dest='state_command', required=True)
-
-    st_pause = state_sub.add_parser('pause', help='Pause an active task')
-    st_pause.add_argument('query', help='Task title query')
-    st_pause.add_argument('--until', help='Optional resume date YYYY-MM-DD')
-    st_pause.set_defaults(func=cmd_state)
-
-    st_delegate = state_sub.add_parser('delegate', help='Delegate an active task')
-    st_delegate.add_argument('query', help='Task title query')
-    st_delegate.add_argument('--to', required=True, help='Assignee')
-    st_delegate.add_argument('--followup', required=True, help='Follow-up date YYYY-MM-DD')
-    st_delegate.set_defaults(func=cmd_state)
-
-    st_backlog = state_sub.add_parser('backlog', help='Move active task to backlog')
-    st_backlog.add_argument('query', help='Task title query')
-    st_backlog.add_argument('--dept', help='Department tag')
-    st_backlog.add_argument('--priority', choices=['urgent', 'high', 'medium', 'low'])
-    st_backlog.set_defaults(func=cmd_state)
-
-    st_drop = state_sub.add_parser('drop', help='Drop active task and archive as dropped')
-    st_drop.add_argument('query', help='Task title query')
-    st_drop.set_defaults(func=cmd_state)
-
     promote_parser = subparsers.add_parser('promote-from-backlog', help='Promote top backlog item(s)')
     promote_parser.add_argument('--cap', type=int, default=1, help='Max items to promote')
     promote_parser.set_defaults(func=cmd_promote_from_backlog)
@@ -2002,32 +2382,9 @@ def main():
     review_parser.add_argument('--json', action='store_true')
     review_parser.set_defaults(func=cmd_review_backlog)
 
-    # Move command
-    move_parser = subparsers.add_parser('move', help='Move task to a different priority section')
-    move_parser.add_argument('query', help='Task title (fuzzy match)')
-    move_parser.add_argument('--to', required=True,
-                             choices=['high', 'medium', 'waiting', 'parking-lot', 'backlog'],
-                             help='Target section')
-    move_parser.set_defaults(func=cmd_move)
-
-    # Edit command
-    edit_parser = subparsers.add_parser('edit', help='Edit properties of an existing task')
-    edit_parser.add_argument('query', help='Task title (fuzzy match)')
-    edit_parser.add_argument('--title', help='New task title')
-    edit_parser.add_argument('--area', help='Replace area tag')
-    edit_parser.add_argument('--due', help='Set/update due date (YYYY-MM-DD)')
-    edit_parser.add_argument('--note', help='Replace task note block')
-    edit_parser.add_argument('--append-note', help='Append a line to task notes')
-    edit_parser.set_defaults(func=cmd_edit)
-
-    # Show command
-    show_parser = subparsers.add_parser('show', help='Show full details of a single task')
-    show_parser.add_argument('query', help='Task title (fuzzy match)')
-    show_parser.set_defaults(func=cmd_show)
-
     args = parser.parse_args()
     args.func(args)
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(error_envelope.run_main("tasks", main))
