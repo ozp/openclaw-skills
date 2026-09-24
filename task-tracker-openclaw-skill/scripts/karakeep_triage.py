@@ -6,7 +6,7 @@ Current behavior:
 - inspect a small inbox slice from Karakeep list `Todo`
 - run `read-link` before classification
 - compute deterministic baseline routing
-- compute semantic/model-assisted recommendation through LiteLLM/ModelRelay
+- compute semantic/model-assisted recommendation through LiteLLM/FreeLLMAPI
 - keep deterministic fallback and bias disagreements toward Review
 - move bookmarks out of `Todo` into `Incorporated` or `Review`
 - keep mutation narrow and explicit (`--apply` required)
@@ -44,7 +44,7 @@ INCORPORATED_LIST_NAME = "Incorporated"
 REVIEW_LIST_NAME = "Review"
 DEFAULT_LIMIT = 5
 DEFAULT_LITELLM_BASE_URL = "http://localhost:4000/v1"
-DEFAULT_SEMANTIC_MODEL = "modelrelay/auto-fastest"
+DEFAULT_SEMANTIC_MODEL = "freellm/auto"
 LITELLM_ENV_FILE = Path("/home/ozp/.config/env/.env")
 
 # --- Mission Control integration ---
@@ -365,7 +365,7 @@ ENVIRONMENT_CONTEXT = """\
 - MCPHub on localhost:3000 (24 MCP servers)
 - Mission Control on localhost:3100/8001 (task management, 10 boards)
 - BrowserOS on localhost:9000 (Playwright-based, CDP on 9024)
-- ModelRelay on localhost:7352 (free model auto-routing)
+- FreeLLMAPI on localhost:7353 (free model auto-routing)
 
 ## Key decisions already made
 - Karakeep stays as pure OpenClaw agent (Opção A), writes to MC via API
@@ -392,15 +392,15 @@ Each bookmark analysis should explain WHY it matters (or doesn't) for this speci
 """
 
 
-# --- ModelRelay summarization step ---
+# --- FreeLLMAPI summarization step ---
 
-def summarize_via_modelrelay(
+def summarize_via_freellm(
     bookmark: dict,
     read_payload: dict,
     user_instruction: str,
     model: str = DEFAULT_SEMANTIC_MODEL,
 ) -> dict[str, Any]:
-    """Call ModelRelay to produce an enriched summary + pre-classification hint."""
+    """Call FreeLLMAPI to produce an enriched summary + pre-classification hint."""
     key = get_litellm_key()
     if not key:
         return {"status": "skipped", "reason": "no_litellm_key"}
@@ -1108,10 +1108,10 @@ def classify_bookmark_payload(
     read_payload = read_bookmark_context(bookmark)
     deterministic = match_existing_task(bookmark, tasks=tasks, read_payload=read_payload)
 
-    # LLM-generated enrichment via ModelRelay (now with rich Karakeep context)
+    # LLM-generated enrichment via FreeLLMAPI (now with rich Karakeep context)
     llm_summary: dict[str, Any] = {"status": "skipped"}
     if semantic_enabled:
-        llm_summary = summarize_via_modelrelay(
+        llm_summary = summarize_via_freellm(
             bookmark, read_payload, user_instruction, model=model,
         )
 

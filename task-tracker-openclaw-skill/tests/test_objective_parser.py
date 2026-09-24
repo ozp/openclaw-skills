@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from tasks import _remove_task_line
+from task_lines import remove_task_line
 from utils import detect_format, parse_tasks
 
 
@@ -132,16 +132,29 @@ def test_plain_and_bold_task_patterns_are_both_parsed():
     assert plain["area"] == "Marketing"
 
 
-def test_parse_multiple_note_meta_values_keeps_first_note_and_full_list():
+def test_plain_task_line_task_id_metadata_is_parsed():
     content = """## 🔴 Q1: Urgent & Important
-- [ ] **Task with metadata** area:: Ops note:: karakeep:bm-1 note:: source:captured owner:: me
+- [ ] Plain task task_id::tsk_plain area:: Ops
 """
 
     tasks = parse_tasks(content, format="obsidian")
-    task = next(t for t in tasks["all"] if t["title"] == "Task with metadata")
+    item = tasks["all"][0]
 
-    assert task["note"] == "karakeep:bm-1"
-    assert task["note_meta"] == ["karakeep:bm-1", "source:captured"]
+    assert item["title"] == "Plain task"
+    assert item["task_id"] == "tsk_plain"
+    assert item["area"] == "Ops"
+
+
+def test_legacy_task_id_metadata_is_parsed():
+    content = """## 🔴 Q1: Urgent & Important
+- [ ] Legacy task task_id::tsk_legacy
+"""
+
+    tasks = parse_tasks(content, format="legacy")
+    item = tasks["all"][0]
+
+    assert item["title"] == "Legacy task"
+    assert item["task_id"] == "tsk_legacy"
 
 
 def test_remove_task_line_removes_parent_and_subtasks():
@@ -153,7 +166,7 @@ def test_remove_task_line_removes_parent_and_subtasks():
 - [ ] Sibling objective
 """
 
-    updated = _remove_task_line(content, "- [ ] Parent objective")
+    updated = remove_task_line(content, "- [ ] Parent objective", 2)
 
     assert updated == """## Objectives
 - [ ] Sibling objective
@@ -167,10 +180,22 @@ def test_remove_task_line_preserves_sibling_tasks():
   - [ ] Child B1
 """
 
-    updated = _remove_task_line(content, "- [ ] Parent A")
+    updated = remove_task_line(content, "- [ ] Parent A", 1)
 
     assert updated == """- [ ] Parent B
   - [ ] Child B1
+"""
+
+
+def test_remove_task_line_removes_tab_indented_children():
+    content = """- [x] Parent task
+\t- [ ] Tab child
+- [ ] Sibling task
+"""
+
+    updated = remove_task_line(content, "- [x] Parent task", 1)
+
+    assert updated == """- [ ] Sibling task
 """
 
 
@@ -179,7 +204,7 @@ def test_remove_task_line_handles_flat_task():
 - [ ] Task two
 """
 
-    updated = _remove_task_line(content, "- [ ] Task one")
+    updated = remove_task_line(content, "- [ ] Task one", 1)
 
     assert updated == """- [ ] Task two
 """

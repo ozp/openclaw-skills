@@ -6,22 +6,37 @@ Daily Standup Generator - Creates a concise summary of today's priorities.
 import argparse
 import json
 import os
+import re
 import sys
-from datetime import timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).parent))
+import cos_config
+from candidate_review import candidate_review_summary
+from task_audit import task_audit_summary
 from daily_notes import extract_completed_actions, extract_completed_tasks
+from defended_three import propose_defended_three
+import harvest_window
+import pushback
+import standup_harvest
 from standup_common import (
+    calendar_error,
     flatten_calendar_events,
     format_missed_tasks_block,
     format_time,
     get_calendar_events,
     resolve_standup_date,
 )
+import error_envelope
+import reconcile
+import telegram_buttons
+from task_ledger import read_events
+from task_records import fallback_id_for
 from utils import (
     load_tasks,
+    get_tasks_file,
     get_missed_tasks_bucketed,
     regroup_by_effective_priority,
     summarize_objective_progress,
@@ -33,6 +48,277 @@ from utils import (
     sprint_suffix,
 )
 
+AUTO_COMPLETION_SOURCES = frozenset({"chat_capture", "merged_pr", "calendar"})
+TAPPED_COMPLETION_SOURCES = frozenset({"user_command", "completion_candidate", "ledger_agent"})
+EXPLICIT_RECALL_AUTO_EVENTS = frozenset({"auto_completion_shown"})
+EXPLICIT_RECALL_ACCEPTED_EVENTS = frozenset({"auto_completion_accepted", "accepted"})
+EXPLICIT_RECALL_EXPIRED_EVENTS = frozenset({"auto_completion_expired", "expired"})
+EXPLICIT_RECALL_EVENTS = (
+    EXPLICIT_RECALL_AUTO_EVENTS
+    | EXPLICIT_RECALL_ACCEPTED_EVENTS
+    | EXPLICIT_RECALL_EXPIRED_EVENTS
+    | {"capture_miss"}
+)
+
+
+def tomorrow_pointer_state(records=None) -> dict:
+    """Resolve the EOD-set #1 pointer into the single standup #1 state."""
+    try:
+        import tomorrow_pointer
+
+        if records is None:
+            from task_records import load_records
+
+            _, _, records = load_records(personal=False)
+        resolved = tomorrow_pointer.resolve_to_record(records)
+    except Exception:
+        return {
+            "status": "unavailable",
+            "task_id": None,
+            "title": "",
+            "line": "🎯 **No #1 set — pick one today.**",
+        }
+
+    status = resolved.get("status")
+    if status == tomorrow_pointer.STATUS_ACTIVE:
+        title = str(resolved.get("title") or "")
+        return {
+            "status": status,
+            "task_id": resolved.get("task_id"),
+            "title": title,
+            "line": f"🎯 **Today's #1 (set last night):** {title}",
+        }
+    if status == tomorrow_pointer.STATUS_STALE:
+        return {
+            "status": status,
+            "task_id": resolved.get("task_id"),
+            "title": "",
+            "line": "🎯 **Last night's #1 is done — pick a fresh one.**",
+        }
+    return {
+        "status": status,
+        "task_id": None,
+        "title": "",
+        "line": "🎯 **No #1 set — pick one today.**",
+    }
+
+
+def capacity_line(records=None):
+    """Build the Layer-2 capacity ceiling line for the standup, or None.
+
+    Reuses ``focus_core`` so the standup display and the ``add_task`` write-time
+    gate agree on one calculation. ``records`` is the parsed work-task record
+    list; when omitted it is loaded from the work file. Any failure degrades to
+    None (no capacity line) rather than breaking the whole standup.
+    """
+    try:
+        from focus_core import capacity_display, summarize_capacity
+
+        if records is None:
+            from task_records import load_records
+
+            _, _, records = load_records(personal=False)
+        return capacity_display(summarize_capacity(records))
+    except Exception:
+        return None
+
+
+def tomorrow_pointer_line(records=None) -> str:
+    """The standup's OPENING line: tomorrow's #1, resolved from the U6 pointer.
+
+    This is the read side of the standup<->EOD daily loop (KTD-6 / R2). The EOD sets
+    "tomorrow's #1" in ``tomorrow-pointer.json``; this line resolves that pointer against
+    the LIVE active board and opens the standup with it. Four outcomes, mirroring
+    ``tomorrow_pointer.resolve_to_record``:
+
+    * a still-active pointer -> ``🎯 **Today's #1 (set last night):** <live title>``,
+    * an explicit "none" pointer or no pointer file -> ``🎯 **No #1 set — pick one today.**``
+      (the EOD ran on an empty board, or never ran),
+    * a since-completed/dropped pointer -> ``🎯 **Last night's #1 is done — pick a fresh
+      one.**`` (degrade cleanly; NEVER resurface a dead #1).
+
+    NEVER crashes the standup: any resolution failure degrades to the "pick one" line
+    rather than raising, so a broken pointer can never blank the morning standup.
+    """
+    return tomorrow_pointer_state(records=records)["line"]
+
+
+def _line_number_int(value) -> int | None:
+    try:
+        return int(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _fallback_identity(task: dict) -> str | None:
+    if task.get("fallback_id"):
+        return str(task["fallback_id"])
+    raw_line = str(task.get("raw_line") or "")
+    if not raw_line:
+        return None
+    return fallback_id_for(raw_line, _line_number_int(task.get("line_number")))
+
+
+def _task_key(task: dict) -> tuple[str, str]:
+    task_id = task.get("task_id") or task.get("legacy_id")
+    if task_id:
+        return ("id", str(task_id))
+    fallback_id = _fallback_identity(task)
+    if fallback_id:
+        return ("id", fallback_id)
+    return ("title", str(task.get("title") or "").casefold())
+
+
+def _dedupe_tasks(tasks: list[dict], *, seen: set[tuple[str, str]] | None = None) -> list[dict]:
+    seen = seen if seen is not None else set()
+    deduped = []
+    for task in tasks or []:
+        key = _task_key(task)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(task)
+    return deduped
+
+
+def _load_focus_records(capacity_records):
+    if capacity_records is not None:
+        return capacity_records
+    try:
+        from task_records import load_records
+
+        _, _, records = load_records(personal=False)
+        return records
+    except Exception:
+        return None
+
+
+def _daily_top_priorities(records, *, reference_date: date) -> tuple[list[dict], bool]:
+    try:
+        proposal = propose_defended_three(records or [], reference_date=reference_date.isoformat())
+    except Exception:
+        return [], True
+    return proposal.defended[:3], False
+
+
+def _find_task_by_id(tasks_data: dict, task_id: str | None) -> dict | None:
+    if not task_id:
+        return None
+    for task in tasks_data.get("all", []) or []:
+        if task.get("task_id") == task_id or task.get("legacy_id") == task_id:
+            return task
+    for section in ("q1", "q2", "q3", "due_today", "team"):
+        for task in tasks_data.get(section, []) or []:
+            if task.get("task_id") == task_id or task.get("legacy_id") == task_id:
+                return task
+    return None
+
+
+def _pointer_priority_row(output: dict) -> dict | None:
+    pointer_state = output.get("tomorrow_pointer_state") or {}
+    task_id = pointer_state.get("task_id")
+    if pointer_state.get("status") != "active" or not task_id:
+        return None
+    task = dict(output.get("priority") or {})
+    task["task_id"] = task_id
+    task["title"] = pointer_state.get("title") or task.get("title") or ""
+    return task
+
+
+def _daily_priority_rows_for_render(output: dict) -> list[dict]:
+    rows = list(output.get("daily_top_priorities") or [])
+    pointer_row = _pointer_priority_row(output)
+    if pointer_row is None:
+        return rows[:3]
+
+    selected = [pointer_row]
+    seen = {_task_key(pointer_row)}
+    for row in rows:
+        key = _task_key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(row)
+        if len(selected) == 3:
+            break
+
+    return [{**row, "position": index} for index, row in enumerate(selected, start=1)]
+
+
+def _render_daily_top_priorities(
+    lines: list[str],
+    rows: list[dict],
+    *,
+    indent: str = "  ",
+    unavailable: bool = False,
+) -> None:
+    if unavailable:
+        lines.append("⚠️ daily priorities unavailable — check Q1 manually")
+        lines.append("")
+    if not rows:
+        return
+    lines.append("🎯 **Daily Top Priorities:**")
+    for index, row in enumerate(rows[:3], start=1):
+        est_minutes = int(row.get("estimate_minutes") or 0)
+        est = f" ({format_duration(est_minutes)})" if est_minutes > 0 else ""
+        escalated = " 🔺" if row.get("escalated") else ""
+        position = row.get("position") or index
+        lines.append(f"{indent}{position}. {row.get('title')}{escalated}{est}")
+    lines.append("")
+
+
+# --- U8 deterministic cron descriptor (CODE-ONLY -- no live registration) -------
+#
+# The 8am morning standup runs the task-tracker ``daily`` command as a DETERMINISTIC
+# command cron (``payload.kind == "command"``), replacing the legacy Lobster
+# ``Daily Interactive Work Standup`` agentTurn. This is the deterministic-standup half
+# of R2: the entry the 8am cron runs is the same ``telegram-commands.sh daily`` a user
+# runs by hand -- no LLM relay. The descriptor below is a CODE-ONLY TEMPLATE the operator
+# hands to ``openclaw cron add``; nothing here registers a live cron, edits
+# ``openclaw.json``, or restarts the gateway (the cron swap + the legacy-cron deletion
+# are DEFERRED OPERATOR steps, gated on the U8 parity check). The env-var NAMES (not
+# values) are embedded so the operator resolves the live target at registration time --
+# no real chat id is committed (public-repo hygiene).
+
+# The 8am morning-standup command-cron HOUR (local).
+STANDUP_CRON_HOUR = 8
+
+# The standup announces to the Productivity STANDUP thread (topic 2) -- the working
+# standup surface, NOT the DONE thread the EOD posts to. Env-var NAMES only.
+STANDUP_CHAT_ID_ENV = "TELEGRAM_CHAT_ID_PRODUCTIVITY"
+STANDUP_TOPIC_ID_ENV = "OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP"
+
+
+def standup_cron_descriptor(
+    *, chat_id_env: str = STANDUP_CHAT_ID_ENV, topic_env: str = STANDUP_TOPIC_ID_ENV,
+    scripts_dir: str = "/data/.openclaw/skills/task-tracker/scripts",
+) -> dict:
+    """The deterministic-command-cron descriptor for the 8am standup (CODE-ONLY template).
+
+    Mirrors the U4-nag / U7-EOD cron shape: ``payload.kind == "command"`` (a deterministic
+    argv, NOT an LLM agentTurn), running ``telegram-commands.sh daily`` in the skill's
+    scripts dir, with ``delivery.mode == "announce"`` to the Productivity STANDUP thread.
+    This is a TEMPLATE the operator hands to ``openclaw cron add``; nothing here registers
+    a live cron, edits ``openclaw.json``, or restarts the gateway (a deferred OPERATOR
+    step, gated on the parity check). The env-var NAMES (not values) are embedded so the
+    operator resolves the live target at registration time -- no real chat id is committed.
+    """
+    return {
+        "schedule": {"kind": "daily", "hour": STANDUP_CRON_HOUR, "minute": 0},
+        "payload": {
+            "kind": "command",
+            "argv": [
+                "sh", "-c",
+                f"cd {scripts_dir} && bash telegram-commands.sh daily",
+            ],
+        },
+        "delivery": {
+            "mode": "announce",
+            "chat_id_env": chat_id_env,
+            "topic_env": topic_env,
+        },
+    }
+
 
 def group_by_area(tasks):
     """Group tasks by area (falls back to department for objectives format tasks)."""
@@ -43,6 +329,324 @@ def group_by_area(tasks):
             areas[area] = []
         areas[area].append(t)
     return areas
+
+
+def _identity_fields(task: dict) -> dict:
+    task_id = task.get("task_id") or task.get("legacy_id")
+    fallback_id = _fallback_identity(task)
+    return {
+        "task_id": task_id,
+        "fallback_id": fallback_id,
+        "missing_task_id": task.get("task_id") is None,
+        "fallback_only": task_id is None,
+    }
+
+
+def _standup_harvest_result(
+    date_str: str | None,
+    *,
+    trigger: str,
+    resolved_window: harvest_window.HarvestWindow | None = None,
+) -> dict:
+    try:
+        return standup_harvest.harvest(
+            target_date=date_str,
+            trigger=trigger,
+            resolved_window=resolved_window,
+        )
+    except Exception as exc:  # noqa: BLE001 -- standup must degrade, not blank
+        error_envelope.log_degraded("standup:harvest", exc, trigger=trigger, check="evidence_harvest")
+        return {"evidence_candidates": [], "health": {"status": "failed"}, "window": None}
+
+
+def _candidate_task_suffix(candidate: dict) -> str:
+    task_id = candidate.get("matched_task_id") or candidate.get("suggested_task_id")
+    return f" -> {task_id}" if task_id else ""
+
+
+def _completed_board_items(items: list[dict]) -> list[dict]:
+    completed: list[dict] = []
+    for item in items:
+        copied = dict(item)
+        if "meeting::" in str(copied.get("raw_line") or ""):
+            copied["is_calendar_meeting"] = True
+        completed.append(copied)
+    return completed
+
+
+def _draft_summary_lines(summary: dict | None, *, indent: str = "  ") -> list[str]:
+    if not summary or not summary.get("bullets"):
+        return []
+    lines = ["**Draft summary (unconfirmed):**"]
+    disclosure = summary.get("disclosure")
+    if disclosure:
+        lines.append(f"{indent}_{disclosure}_")
+    grouped: dict[str, list[dict]] = {}
+    for bullet in summary.get("bullets") or []:
+        area = str(bullet.get("area") or "unclassified")
+        grouped.setdefault(area, []).append(bullet)
+    for area in sorted(grouped):
+        lines.append(f"{indent}{area}:")
+        for bullet in grouped[area]:
+            lines.append(f"{indent}  • {bullet.get('bullet')}")
+    lines.append(f"{indent}Read-only draft; not recorded as completed.")
+    return lines
+
+
+def _local_aware(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=cos_config.local_tz())
+    return dt.astimezone(cos_config.local_tz())
+
+
+def _parse_event_timestamp(event: dict) -> datetime | None:
+    raw = event.get("timestamp")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _local_aware(parsed)
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return left.expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
+
+
+def _work_board_path() -> Path | None:
+    raw = os.getenv("TASK_TRACKER_WORK_FILE")
+    if raw:
+        return Path(raw).expanduser()
+    try:
+        path, _fmt = get_tasks_file(personal=False)
+    except Exception:  # noqa: BLE001 -- standup must degrade instead of blanking
+        return None
+    return path
+
+
+def _parse_since_env(raw: str, now: datetime) -> datetime | None:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        return _local_aware(parsed)
+
+    match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", raw)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or "0")
+    if hour > 23 or minute > 59:
+        return None
+    return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def _auto_completion_since(now: datetime | None = None) -> datetime:
+    now = _local_aware(now or cos_config.local_now())
+    raw_since = os.getenv("TASK_TRACKER_MORNING_VETO_SINCE")
+    if raw_since:
+        parsed = _parse_since_env(raw_since, now)
+        if parsed is not None:
+            return parsed
+
+    try:
+        hour = int(os.getenv("TASK_TRACKER_MORNING_VETO_SINCE_HOUR", "6"))
+    except ValueError:
+        hour = 6
+    hour = min(max(hour, 0), 23)
+    return now.replace(hour=hour, minute=0, second=0, microsecond=0)
+
+
+def _completion_id(event: dict) -> str | None:
+    metadata = event.get("metadata") or {}
+    value = metadata.get("completion_id") or event.get("event_id")
+    return value if isinstance(value, str) and value else None
+
+
+def _reverted_completion_ids(events: list[dict]) -> set[str]:
+    reverted: set[str] = set()
+    for event in events:
+        if event.get("event_type") != "state_transition_reverted":
+            continue
+        metadata = event.get("metadata") or {}
+        for key in ("completion_id", "reverted_event_id"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value:
+                reverted.add(value)
+    return reverted
+
+
+def _has_auto_marker(event: dict) -> bool:
+    metadata = event.get("metadata") or {}
+    for key in (
+        "auto",
+        "auto_completion",
+        "auto_completed",
+        "auto_done",
+        "auto_marker",
+        "autowrite",
+        "high_trust_auto",
+    ):
+        if metadata.get(key) is True:
+            return True
+    marker = str(metadata.get("source") or metadata.get("origin") or "").casefold()
+    return marker in AUTO_COMPLETION_SOURCES or marker.startswith("auto")
+
+
+def _is_auto_completion(event: dict) -> bool:
+    return (
+        event.get("event_type") == "state_transition"
+        and event.get("next_state") == "done"
+        and _completion_id(event) is not None
+        and (
+            str(event.get("source") or "").casefold() in AUTO_COMPLETION_SOURCES
+            or _has_auto_marker(event)
+        )
+    )
+
+
+def _is_tapped_completion(event: dict) -> bool:
+    return (
+        event.get("event_type") == "state_transition"
+        and event.get("next_state") == "done"
+        and str(event.get("source") or "").casefold() in TAPPED_COMPLETION_SOURCES
+    )
+
+
+def _in_window(event: dict, *, since: datetime, now: datetime) -> bool:
+    stamped = _parse_event_timestamp(event)
+    return stamped is not None and since <= stamped <= now
+
+
+def _recall_counts(events: list[dict], *, since: datetime, now: datetime) -> dict:
+    windowed = [event for event in events if _in_window(event, since=since, now=now)]
+    shown = sum(1 for event in windowed if event.get("event_type") in EXPLICIT_RECALL_AUTO_EVENTS)
+    accepted = sum(1 for event in windowed if event.get("event_type") in EXPLICIT_RECALL_ACCEPTED_EVENTS)
+    expired = sum(1 for event in windowed if event.get("event_type") in EXPLICIT_RECALL_EXPIRED_EVENTS)
+    missed = sum(1 for event in windowed if event.get("event_type") == "capture_miss")
+    explicit = any(event.get("event_type") in EXPLICIT_RECALL_EVENTS for event in windowed)
+
+    auto = shown if shown else sum(1 for event in windowed if _is_auto_completion(event))
+    tapped = accepted if accepted else sum(1 for event in windowed if _is_tapped_completion(event))
+    return {
+        "auto": auto,
+        "shown": shown,
+        "accepted": accepted,
+        "tapped": tapped,
+        "expired": expired,
+        "missed_captures": missed,
+        "has_explicit_events": explicit,
+        "line": (
+            f"Recall: auto {auto}; tapped {tapped}; expired {expired}; "
+            f"missed captures {missed}"
+        ),
+    }
+
+
+def _undo_action(completion_id: str) -> dict:
+    callback_data = telegram_buttons.encode("undo", completion_id)
+    action = {
+        "label": "UNDO",
+        "completion_id": completion_id,
+        "command": ["python3", "scripts/tasks.py", "revert", completion_id],
+    }
+    if callback_data:
+        action["value"] = callback_data
+        action["callback_data"] = callback_data
+    return action
+
+
+def _auto_completion_row(event: dict) -> dict:
+    metadata = event.get("metadata") or {}
+    completion_id = _completion_id(event) or ""
+    stamped = _parse_event_timestamp(event)
+    completed_at = stamped.isoformat() if stamped else None
+    title = metadata.get("title") or event.get("title") or event.get("task_id") or completion_id
+    return {
+        "completion_id": completion_id,
+        "task_id": event.get("task_id"),
+        "title": str(title),
+        "source": event.get("source"),
+        "completed_at": completed_at,
+        "completed_time": stamped.strftime("%-I:%M %p") if stamped else "",
+        "action": _undo_action(completion_id),
+    }
+
+
+def _is_work_board_completion(event: dict, work_board: Path | None) -> bool:
+    metadata = event.get("metadata") or {}
+    snapshot = metadata.get("board_snapshot")
+    if not isinstance(snapshot, dict):
+        return False
+    raw_file = snapshot.get("file")
+    if not isinstance(raw_file, str) or not raw_file:
+        return False
+    if work_board is None:
+        return False
+    return _same_path(Path(raw_file), work_board)
+
+
+def _auto_completions_section(events: list[dict] | None = None, *, now: datetime | None = None) -> dict | None:
+    """Recent auto-completions from the current morning window, keyed by completion_id."""
+    now = _local_aware(now or cos_config.local_now())
+    since = _auto_completion_since(now)
+    work_board = _work_board_path()
+    try:
+        ledger_events = read_events() if events is None else events
+    except Exception as exc:  # noqa: BLE001 -- standup must degrade, not blank
+        error_envelope.log_degraded("standup:auto-completions", exc, trigger="user_command:/standup")
+        return None
+
+    reverted = _reverted_completion_ids(ledger_events)
+    rows = []
+    seen_completion_ids: set[str] = set()
+    for event in ledger_events:
+        completion_id = _completion_id(event)
+        if not completion_id or completion_id in reverted or completion_id in seen_completion_ids:
+            continue
+        if not _in_window(event, since=since, now=now):
+            continue
+        if not _is_auto_completion(event):
+            continue
+        # U6 callback dispatch currently reverts through tasks.py on the WORK board only.
+        # Until personal-board threading exists, only surface rows whose snapshot proves
+        # they belong to the configured work board.
+        if not _is_work_board_completion(event, work_board):
+            continue
+        seen_completion_ids.add(completion_id)
+        rows.append(_auto_completion_row(event))
+
+    recall = _recall_counts(ledger_events, since=since, now=now)
+    if not rows and not recall["has_explicit_events"]:
+        return None
+
+    return {
+        "schema_version": "1",
+        "window": {"since": since.isoformat(), "until": now.isoformat()},
+        "items": rows,
+        "recall": recall,
+    }
+
+
+def _render_auto_completions_section(lines: list[str], section: dict | None) -> None:
+    if not section:
+        return
+    items = section.get("items") or []
+    if not items and not (section.get("recall") or {}).get("has_explicit_events"):
+        return
+    lines.append("↩️ **Recent auto-completions:**")
+    for item in items:
+        when = f"{item.get('completed_time')} — " if item.get("completed_time") else ""
+        lines.append(f"  • {when}{item.get('title')}")
+    recall = section.get("recall") or {}
+    if recall.get("line"):
+        lines.append(f"  {recall['line']}.")
+    lines.append("")
 
 
 def format_split_standup(output: dict, date_display: str) -> list:
@@ -67,12 +671,31 @@ def format_split_standup(output: dict, date_display: str) -> list:
             msg1_lines.append("")
     else:
         msg1_lines.append("_No completed items_")
+    if output.get("evidence_candidates"):
+        msg1_lines.append("")
+        msg1_lines.append("**Evidence candidates:**")
+        for candidate in output["evidence_candidates"][:5]:
+            msg1_lines.append(
+                f"  • {candidate.get('title')}{_candidate_task_suffix(candidate)}"
+            )
+    summary_lines = _draft_summary_lines((output.get("evidence_harvest") or {}).get("summary"))
+    if summary_lines:
+        msg1_lines.append("")
+        msg1_lines.extend(summary_lines)
+    auto_completion_lines: list[str] = []
+    _render_auto_completions_section(auto_completion_lines, output.get("auto_completions"))
+    if auto_completion_lines:
+        msg1_lines.append("")
+        msg1_lines.extend(line for line in auto_completion_lines if line)
     messages.append('\n'.join(msg1_lines).strip())
     
     # Message 2: Calendar events
     msg2_lines = [f"📅 **Calendar — {date_display}**\n"]
+    cal_err = calendar_error(output['calendar'])
     all_events = flatten_calendar_events(output['calendar'])
-    if all_events:
+    if cal_err:
+        msg2_lines.append(error_envelope.degraded_notice("Calendar"))
+    elif all_events:
         for event in all_events:
             time_str = format_time(event['start'])
             msg2_lines.append(f"• {time_str} — {event['summary']}")
@@ -82,40 +705,32 @@ def format_split_standup(output: dict, date_display: str) -> list:
     
     # Message 3: Active todos
     msg3_lines = [f"📋 **Todos — {date_display}**\n"]
-    
-    # #1 Priority
-    if output['priority']:
-        priority = output['priority']
-        rec = recurrence_suffix(priority)
-        msg3_lines.append(f"🎯 **#1 Priority:** {priority['title']}{rec}")
-        if priority.get('blocks'):
-            msg3_lines.append(f"   ↳ Blocking: {priority['blocks']}")
-        msg3_lines.append("")
+
+    msg3_lines.append(output.get('tomorrow_pointer_line') or "🎯 **No #1 set — pick one today.**")
+    msg3_lines.append("")
+
+    rendered_seen: set[tuple[str, str]] = set()
+    top_priorities = _dedupe_tasks(_daily_priority_rows_for_render(output), seen=rendered_seen)
+    _render_daily_top_priorities(
+        msg3_lines,
+        top_priorities,
+        unavailable=bool(output.get("daily_top_priorities_unavailable")),
+    )
     
     # Due today
-    if output['due_today']:
+    due_today = _dedupe_tasks(output['due_today'], seen=rendered_seen)
+    if due_today:
         msg3_lines.append("⏰ **Due Today:**")
-        for t in output['due_today']:
+        for t in due_today:
             rec = recurrence_suffix(t)
             msg3_lines.append(f"  • {t['title']}{rec}")
         msg3_lines.append("")
     
-    # Q1 - Urgent & Important
-    if output.get('q1'):
-        msg3_lines.append("🔴 **Urgent & Important (Q1):**")
-        by_area = group_by_area(output['q1'])
-        for area in sorted(by_area.keys()):
-            msg3_lines.append(f"  **{area}:**")
-            for t in by_area[area]:
-                esc = escalation_suffix(t)
-                rec = recurrence_suffix(t)
-                msg3_lines.append(f"    • {t['title']}{esc}{rec}")
-        msg3_lines.append("")
-    
     # Q2 - Important, Not Urgent
-    if output.get('q2'):
+    q2 = _dedupe_tasks(output.get('q2') or [], seen=rendered_seen)
+    if q2:
         msg3_lines.append("🟡 **Important, Not Urgent (Q2):**")
-        by_area = group_by_area(output['q2'])
+        by_area = group_by_area(q2)
         for area in sorted(by_area.keys()):
             msg3_lines.append(f"  **{area}:**")
             for t in by_area[area]:
@@ -125,9 +740,10 @@ def format_split_standup(output: dict, date_display: str) -> list:
         msg3_lines.append("")
     
     # Q3 - Waiting/Blocked
-    if output.get('q3'):
+    q3 = _dedupe_tasks(output.get('q3') or [], seen=rendered_seen)
+    if q3:
         msg3_lines.append("🟠 **Waiting/Blocked (Q3):**")
-        for t in output['q3']:
+        for t in q3:
             blocks_str = f" → {t['blocks']}" if t.get('blocks') else ""
             esc = escalation_suffix(t)
             rec = recurrence_suffix(t)
@@ -135,9 +751,10 @@ def format_split_standup(output: dict, date_display: str) -> list:
         msg3_lines.append("")
     
     # Team tasks
-    if output.get('team'):
+    team = _dedupe_tasks(output.get('team') or [], seen=rendered_seen)
+    if team:
         msg3_lines.append("👥 **Team Tasks:**")
-        for t in output['team']:
+        for t in team:
             owner_str = f" ({t['owner']})" if t.get('owner') else ""
             rec = recurrence_suffix(t)
             msg3_lines.append(f"  • {t['title']}{rec}{owner_str}")
@@ -173,7 +790,10 @@ def _build_daily_note_links(anchor_date: str | None = None) -> dict:
     relative_dir = os.getenv("TASK_TRACKER_DAILY_NOTES_RELATIVE_DIR", "01-TODOs/Daily").strip("/")
 
     from datetime import date
-    base_date = date.today()
+    import cos_config
+    # Local (Pacific) day, not the container's UTC day, so the fallback daily-note
+    # name matches the user's calendar day at Pacific evening.
+    base_date = cos_config.local_today()
     if anchor_date:
         try:
             base_date = date.fromisoformat(anchor_date)
@@ -200,14 +820,26 @@ def _build_daily_note_links(anchor_date: str | None = None) -> dict:
 def build_compact_standup_sections(output: dict) -> dict:
     """Compact standup payload schema v1 for automation clients."""
     done = [t.get('title', '') for t in (output.get('completed') or [])[:12]]
+    rendered_seen: set[tuple[str, str]] = set()
+    due_today = _dedupe_tasks(output.get('due_today') or [], seen=rendered_seen)
     calendar_dos = [
-        {"quick_id": f"c{idx}", "title": t.get('title', ''), "status": "scheduled"}
-        for idx, t in enumerate(output.get('due_today') or [], start=1)
+        {
+            "quick_id": f"c{idx}",
+            "title": t.get('title', ''),
+            "status": "scheduled",
+            **_identity_fields(t),
+        }
+        for idx, t in enumerate(due_today, start=1)
     ]
 
     completed = output.get('completed') or []
     calendar_dones = [
-        {"quick_id": f"cd{idx}", "title": t.get('title', ''), "status": "done"}
+        {
+            "quick_id": f"cd{idx}",
+            "title": t.get('title', ''),
+            "status": "done",
+            **_identity_fields(t),
+        }
         for idx, t in enumerate(
             [
                 t for t in completed
@@ -223,8 +855,21 @@ def build_compact_standup_sections(output: dict) -> dict:
         + [("q2", t) for t in (output.get('q2') or [])]
         + [("q3", t) for t in (output.get('q3') or [])]
     )
-    for idx, (section, t) in enumerate(stack[:20], start=1):
-        dos.append({"quick_id": f"d{idx}", "title": t.get('title', ''), "section": section})
+    for section, t in stack:
+        key = _task_key(t)
+        if key in rendered_seen:
+            continue
+        rendered_seen.add(key)
+        dos.append(
+            {
+                "quick_id": f"d{len(dos) + 1}",
+                "title": t.get('title', ''),
+                "section": section,
+                **_identity_fields(t),
+            }
+        )
+        if len(dos) == 20:
+            break
 
     return {
         "schema_version": "1",
@@ -232,6 +877,9 @@ def build_compact_standup_sections(output: dict) -> dict:
         "calendar_dos": calendar_dos,
         "calendar_dones": calendar_dones,
         "dos": dos,
+        "completion_candidates": output.get("completion_candidates") or {},
+        "evidence_candidates": output.get("evidence_candidates") or [],
+        "auto_completions": output.get("auto_completions"),
         "links": _build_daily_note_links(output.get("date")),
     }
 
@@ -242,6 +890,7 @@ def generate_standup(
     split_output: bool = False,
     tasks_data: dict | None = None,
     notes_dir: Path | None = None,
+    capacity_records=None,
 ) -> str | dict | list:
     """Generate daily standup summary.
 
@@ -256,49 +905,97 @@ def generate_standup(
     if tasks_data is None:
         _, tasks_data = load_tasks()
 
-    standup_date = resolve_standup_date(date_str)
+    # Only a VALID explicit date selects an explicit (target-date) window; a missing
+    # OR malformed date_str falls through to the implicit prior-workday standup window
+    # (a typo must NOT silently retarget the evidence window to today).
+    requested_date: date | None = None
+    if date_str:
+        try:
+            requested_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            requested_date = None
+    standup_window = harvest_window.resolve_standup_window(target_date=requested_date)
+    standup_date = standup_window.plan_date
     date_display = standup_date.strftime("%A, %B %d")
 
     # Build output using new task structure (q1, q2, q3, team, backlog)
     output = {
         'date': str(standup_date),
         'date_display': date_display,
-        'calendar': get_calendar_events(),
+        'week_id': standup_window.week_id,
+        'window_id': standup_window.window_id,
+        'standup_window': standup_window.as_dict(),
+        'calendar': get_calendar_events(trigger="user_command:/standup"),
         'priority': None,
+        'tomorrow_pointer_state': {},
+        'tomorrow_pointer_line': "",
+        'daily_top_priorities': [],
+        'daily_top_priorities_unavailable': False,
         'due_today': [],
         'q1': [],  # Urgent & Important
         'q2': [],  # Important, Not Urgent
         'q3': [],  # Waiting/Blocked
         'team': [],  # Team tasks to monitor
         'completed': [],
+        'evidence_candidates': [],
+        'evidence_harvest': {},
+        'auto_completions': None,
         'objective_progress': {},
+        'capacity': None,
+        'capacity_pushback': None,
     }
+
+    # Layer-2 capacity ceiling line (U3): estimate-sum over active work vs ~1
+    # week of capacity. Degrades to None on any failure rather than breaking the
+    # standup. Skipped for personal standups (the cap governs the work board).
+    output['capacity'] = capacity_line(records=capacity_records)
+    # U9: deterministic capacity push-back (rules only). When the active board is over
+    # the Layer-2 ceiling, surface the most-overdue candidates + a cut/defer/edit ask.
+    # Pure read + render: never chooses, mutates the board, or sends. None when within cap.
+    output['capacity_pushback'] = pushback.capacity_pushback(capacity_records)
 
     # Apply display-only priority escalation
     regrouped = regroup_by_effective_priority(tasks_data, reference_date=standup_date)
 
-    # #1 Priority (escalated Q1 first, then Q2)
-    if regrouped['q1']:
-        output['priority'] = regrouped['q1'][0]
-    elif regrouped['q2']:
-        output['priority'] = regrouped['q2'][0]
+    focus_records = _load_focus_records(capacity_records)
+
+    # U6: the only #1 is the EOD-set tomorrow pointer resolved against the live
+    # board. When absent/stale, the standup prompts for a fresh pick and does not
+    # invent a second #1 from Q1 escalation.
+    pointer_state = tomorrow_pointer_state(records=focus_records)
+    output['tomorrow_pointer_state'] = pointer_state
+    output['tomorrow_pointer_line'] = pointer_state["line"]
+    output['priority'] = _find_task_by_id(tasks_data, pointer_state.get("task_id"))
+    daily_top_priorities, daily_top_priorities_unavailable = _daily_top_priorities(
+        focus_records,
+        reference_date=standup_date,
+    )
+    output['daily_top_priorities'] = daily_top_priorities
+    output['daily_top_priorities_unavailable'] = daily_top_priorities_unavailable
 
     # Due today
-    output['due_today'] = tasks_data.get('due_today', [])
+    output['due_today'] = _dedupe_tasks(tasks_data.get('due_today', []))
 
     # Q1 - Urgent & Important (includes escalated tasks)
-    output['q1'] = regrouped['q1']
+    output['q1'] = _dedupe_tasks(regrouped['q1'])
 
     # Q2 - Important, Not Urgent
-    output['q2'] = regrouped['q2']
+    output['q2'] = _dedupe_tasks(regrouped['q2'])
 
     # Q3 - Waiting/Blocked (includes escalated tasks)
-    output['q3'] = regrouped['q3']
+    output['q3'] = _dedupe_tasks(regrouped['q3'])
 
     # Team tasks
-    output['team'] = tasks_data.get('team', [])
+    output['team'] = _dedupe_tasks(tasks_data.get('team', []))
 
-    # Completed: daily notes primary, board [x] fallback
+    harvest_result = _standup_harvest_result(
+        str(requested_date) if requested_date else None,
+        trigger="user_command:/standup",
+        resolved_window=standup_window,
+    )
+    evidence_candidates = harvest_result.get("evidence_candidates") or []
+
+    # Completed: confirmed user claims only; evidence can enrich but never promote.
     yesterday = standup_date - timedelta(days=1)
     if notes_dir:
         notes_completed = extract_completed_tasks(
@@ -306,26 +1003,26 @@ def generate_standup(
             start_date=yesterday,
             end_date=standup_date,
         )
-        # Merge any stale [x] items from the board (deduplicate)
-        board_done = tasks_data.get('done', [])
-        by_title = {t['title'].casefold(): t for t in notes_completed}
-        for bt in board_done:
-            key = bt['title'].casefold()
-            is_calendar = "meeting::" in str(bt.get("raw_line") or "")
-            if key in by_title:
-                if is_calendar:
-                    by_title[key]["is_calendar_meeting"] = True
-                continue
-            if is_calendar:
-                bt["is_calendar_meeting"] = True
-            by_title[key] = bt
-            notes_completed.append(bt)
-        output['completed'] = notes_completed
+        user_stated = [*notes_completed, *_completed_board_items(tasks_data.get('done', []))]
     else:
-        output['completed'] = tasks_data.get('done', [])
+        user_stated = _completed_board_items(tasks_data.get('done', []))
+
+    output['completed'], output['evidence_candidates'] = reconcile.merge(
+        user_stated,
+        evidence_candidates,
+    )
+    output['evidence_harvest'] = {
+        "health": harvest_result.get("health") or {},
+        "window": harvest_result.get("window") or standup_window.as_dict(),
+        "run_id": harvest_result.get("run_id"),
+        "summary": harvest_result.get("summary"),
+    }
 
     output['objective_progress'] = summarize_objective_progress(tasks_data)
-    
+    output['completion_candidates'] = candidate_review_summary()
+    output['task_audit'] = task_audit_summary(limit=3)
+    output['auto_completions'] = _auto_completions_section()
+
     if json_output:
         return output
     
@@ -334,58 +1031,59 @@ def generate_standup(
     
     # Format as markdown (single message)
     lines = [f"📋 **Daily Standup — {date_display}**\n"]
-    
+
+    # U8: open with tomorrow's #1 (set the prior evening at the EOD), the first content
+    # line of the standup -- the read side of the daily loop.
+    lines.append(output['tomorrow_pointer_line'])
+    lines.append("")
+    _render_auto_completions_section(lines, output.get("auto_completions"))
+
+    rendered_seen: set[tuple[str, str]] = set()
+
     # Calendar events
+    cal_err = calendar_error(output['calendar'])
     all_events = flatten_calendar_events(output['calendar'])
-    if all_events:
+    if cal_err:
+        lines.append(error_envelope.degraded_notice("Calendar"))
+        lines.append("")
+    elif all_events:
         lines.append("📅 **Today's Calendar:**")
         for event in all_events:
             time_str = format_time(event['start'])
             lines.append(f"  • {time_str} — {event['summary']}")
         lines.append("")
-    
-    if output['priority']:
-        priority = output['priority']
-        rec = recurrence_suffix(priority)
-        est = f" ({priority['estimate']})" if priority.get('estimate') else ""
-        lines.append(f"🎯 **#1 Priority:** {priority['title']}{rec}{est}")
-        if priority.get('blocks'):
-            lines.append(f"   ↳ Blocking: {priority['blocks']}")
+
+    top_priorities = _dedupe_tasks(_daily_priority_rows_for_render(output), seen=rendered_seen)
+    _render_daily_top_priorities(
+        lines,
+        top_priorities,
+        unavailable=bool(output.get("daily_top_priorities_unavailable")),
+    )
+
+    if output.get('capacity'):
+        lines.append(output['capacity'])
+        if output.get('capacity_pushback'):
+            lines.append(output['capacity_pushback'])
         lines.append("")
-    
-    if output['due_today']:
-        total_est = sum(parse_duration(t.get('estimate')) for t in output['due_today'])
+
+    due_today = _dedupe_tasks(output['due_today'], seen=rendered_seen)
+    if due_today:
+        total_est = sum(parse_duration(t.get('estimate')) for t in due_today)
         est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
         lines.append(f"⏰ **Due Today:{est_str}**")
-        for t in output['due_today']:
+        for t in due_today:
             rec = recurrence_suffix(t)
             est = f" ({t['estimate']})" if t.get('estimate') else ""
             lines.append(f"  • {t['title']}{rec}{est}")
         lines.append("")
-    
-    # Q1 - Urgent & Important
-    if output['q1']:
-        total_est = sum(parse_duration(t.get('estimate')) for t in output['q1'])
-        est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
-        lines.append(f"🔴 **Urgent & Important (Q1):{est_str}**")
-        by_area = group_by_area(output['q1'])
-        for cat in sorted(by_area.keys()):
-            lines.append(f"  **{cat}:**")
-            for t in by_area[cat]:
-                esc = escalation_suffix(t)
-                rec = recurrence_suffix(t)
-                est = f" ({t['estimate']})" if t.get('estimate') else ""
-                dep = dependency_suffix(t)
-                spr = sprint_suffix(t)
-                lines.append(f"    • {t['title']}{esc}{rec}{est}{dep}{spr}")
-        lines.append("")
-    
+
     # Q2 - Important, Not Urgent
-    if output['q2']:
-        total_est = sum(parse_duration(t.get('estimate')) for t in output['q2'])
+    q2 = _dedupe_tasks(output['q2'], seen=rendered_seen)
+    if q2:
+        total_est = sum(parse_duration(t.get('estimate')) for t in q2)
         est_str = f" [{format_duration(total_est)}]" if total_est > 0 else ""
         lines.append(f"🟡 **Important, Not Urgent (Q2):{est_str}**")
-        by_area = group_by_area(output['q2'])
+        by_area = group_by_area(q2)
         for cat in sorted(by_area.keys()):
             lines.append(f"  **{cat}:**")
             for t in by_area[cat]:
@@ -398,9 +1096,10 @@ def generate_standup(
         lines.append("")
     
     # Q3 - Waiting/Blocked
-    if output['q3']:
+    q3 = _dedupe_tasks(output['q3'], seen=rendered_seen)
+    if q3:
         lines.append("🟠 **Waiting/Blocked (Q3):**")
-        for t in output['q3']:
+        for t in q3:
             blocks_str = f" → {t['blocks']}" if t.get('blocks') else ""
             esc = escalation_suffix(t)
             rec = recurrence_suffix(t)
@@ -409,9 +1108,10 @@ def generate_standup(
         lines.append("")
     
     # Team tasks
-    if output['team']:
+    team = _dedupe_tasks(output['team'], seen=rendered_seen)
+    if team:
         lines.append("👥 **Team Tasks:**")
-        for t in output['team']:
+        for t in team:
             owner_str = f" ({t['owner']})" if t.get('owner') else ""
             rec = recurrence_suffix(t)
             lines.append(f"  • {t['title']}{rec}{owner_str}")
@@ -424,6 +1124,49 @@ def generate_standup(
             lines.append(f"  • {t['title']}{rec}")
         if len(output['completed']) > 5:
             lines.append(f"  • ... and {len(output['completed']) - 5} more")
+
+    if output.get('evidence_candidates'):
+        lines.append("")
+        lines.append(f"🧾 **Evidence Candidates:** ({len(output['evidence_candidates'])} items)")
+        for candidate in output['evidence_candidates'][:5]:
+            status = candidate.get("association_status") or candidate.get("decision")
+            lines.append(
+                f"  • [{candidate.get('source')}] {candidate.get('title')}"
+                f"{_candidate_task_suffix(candidate)} ({status})"
+            )
+        if len(output['evidence_candidates']) > 5:
+            lines.append(f"  • ... and {len(output['evidence_candidates']) - 5} more")
+
+    summary_lines = _draft_summary_lines((output.get("evidence_harvest") or {}).get("summary"))
+    if summary_lines:
+        lines.append("")
+        lines.extend(summary_lines)
+
+    candidates = output.get('completion_candidates') or {}
+    if candidates.get('review_required'):
+        lines.append("")
+        lines.append(f"🧾 **Completion Candidates:** {candidates.get('total', 0)} review required")
+        for candidate in candidates.get('items', [])[:3]:
+            task_hint = candidate.get('confirmable_task_id') or candidate.get('suggested_task_id')
+            suffix = f" → {task_hint}" if task_hint else ""
+            lines.append(f"  • {candidate.get('candidate_id')}: {candidate.get('summary')}{suffix}")
+        if candidates.get('overflow'):
+            lines.append(f"  • ... and {candidates['overflow']} more")
+        lines.append("  Review required; do not auto-complete from this summary.")
+
+    audit = output.get('task_audit') or {}
+    if audit.get('review_required') and not audit.get('available', True):
+        error = audit.get('error') or {}
+        lines.append("")
+        lines.append(f"🧹 **Task Audit:** unavailable ({error.get('code', 'unknown-error')})")
+    elif audit.get('review_required'):
+        lines.append("")
+        lines.append(f"🧹 **Task Audit:** {audit.get('total', 0)} finding(s) need review")
+        for finding in audit.get('items', [])[:3]:
+            lines.append(f"  • {finding.get('severity')}: {finding.get('code')} — {finding.get('reason')}")
+        if audit.get('overflow'):
+            lines.append(f"  • ... and {audit['overflow']} more")
+        lines.append("  Run `tasks.py task-audit`; do not mutate from audit text.")
 
     objective_progress = output.get('objective_progress') or {}
     if objective_progress.get('total_objectives', 0) > 0:
@@ -493,4 +1236,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(error_envelope.run_main("standup", main))

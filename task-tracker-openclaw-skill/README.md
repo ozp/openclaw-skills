@@ -33,16 +33,61 @@ python3 scripts/weekly_review.py
 ## What this skill provides
 
 - Task list/add/done workflows for work and personal boards
-- Daily standup summaries (`standup.py`, `personal_standup.py`)
+- Canonical task identity audit/repair with inline `task_id::` metadata
+- Append-only JSONL event ledger for repairs and ID-based completions
+- Durable completion evidence inbox for review/confirm/reject/snooze decisions
+- Read-only task health audits for duplicate titles, stale tasks, identity
+  issues, candidates, and backlog pressure
+- Daily standup summaries (`standup.py`, `personal_standup.py`) — the work standup
+  opens with the EOD-set tomorrow's #1
+- **Priority-first nag** that chases today's committed priorities (with a Start
+  initiation button), not just worst-overdue
+- **EOD ritual** (`telegram-commands.sh eod`): detect-done → confirm → disposition
+  every open task → set tomorrow's #1, feeding the board, ledger, a tomorrow-pointer,
+  and an Obsidian `## EOD Summary`
+- **Inline-button UX**: nags, EOD, and disposition are tappable (`tt:` gateway
+  plugin → existing deterministic commands) instead of copy-paste task IDs
 - Weekly review + archive workflows (`weekly_review.py`, `archive.py`)
-- State transitions and backlog hygiene (`tasks.py state ...`)
+- Backlog and delegated-task hygiene
 - Action extraction from notes (`extract_tasks.py`)
-- End-of-day sync into weekly TODOs (`eod_sync.py`)
+- End-of-day evidence reporting retained, with legacy Weekly TODO writes behind
+  `--apply`
 - Weekly transclusion refresh for Obsidian (`update_weekly_embeds.py`)
 
 ## Compatibility
 
-This repository keeps existing scripts and command behavior intact. The recent docs refactor reorganizes guidance into `references/` and keeps legacy migration notes available.
+Active task mutations now require canonical `task_id::` values. Legacy title
+matching remains useful for read-only review and migration diagnostics, but
+write paths block when they cannot resolve exactly one canonical task.
+Fallback IDs may appear in JSON output for diagnostics; they are not valid
+mutation targets.
+
+Completion evidence candidates are suggestions stored in the ledger. Scanning
+daily-log/EOD-style evidence never changes active tasks. Candidate confirmation
+uses the same canonical-ID completion path as `tasks.py done`.
+
+Chat capture uses a two-lane trust model. **Free-form chat prose never
+auto-writes** — every raw `tasks.py capture --text "..."` message becomes a
+one-tap candidate (the extractor only ranks/prefills the suggested task; it is
+not an authorization boundary). Conversational chat completion writes happen
+**only** when the owner taps an inline `tt:done:<task_id>` button posted by the
+OpenClaw completion assistant. A leading completion phrase such as `done the
+JAMS thing` resolves against open, non-recurring, non-objective tasks and posts a
+confirm/disambiguation prompt; the prose itself never mutates the board. The
+assistant also owns the chat-scope gate; `tasks.py --personal capture ...` is
+refused.
+
+Candidate JSON distinguishes direct confirmation from suggestions:
+`confirmable_task_id` appears only for exact canonical ID/link evidence.
+Title, fuzzy, fallback, and normalized-title evidence expose `suggested_match`
+and still require an explicit canonical `--task-id`. Standup, EOD, weekly, and
+workflow-control surfaces may show candidate counts and IDs, but they must not
+auto-complete tasks. Gmail, calendar, and session-log evidence ingestion remains
+deferred.
+
+Periodic task audits are also read-only. They surface task-health findings and
+safe next actions, but they do not freeze, delete, merge, complete, or otherwise
+mutate tasks.
 
 ## Development
 

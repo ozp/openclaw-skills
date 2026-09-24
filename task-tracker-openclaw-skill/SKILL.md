@@ -1,12 +1,45 @@
 ---
-name: task-tracker
+name: task-tracker-openclaw-skill
 description: "Personal task management with daily standups and weekly reviews. Supports both Work and Personal tasks from Obsidian. Use when: (1) User says 'daily standup' or asks what's on my plate, (2) User says 'weekly review' or asks about last week's progress, (3) User wants to add/update/complete tasks, (4) User asks about blockers or deadlines, (5) User shares meeting notes and wants tasks extracted, (6) User asks 'what's due this week' or similar."
+homepage: https://github.com/kesslerio/task-tracker-openclaw-skill
 metadata: {"openclaw":{"emoji":"📋","requires":{"env":["TASK_TRACKER_WORK_FILE","TASK_TRACKER_PERSONAL_FILE"]},"install":[{"id":"verify-paths","kind":"check","label":"Verify task file paths are configured"}]}}
 ---
 
 # Task Tracker
 
-Personal task management for work + personal workflows, with daily standups and weekly reviews.
+Personal task management for work + personal workflows, with daily standups and
+weekly reviews.
+
+Source-of-truth model: active task boards are the current task state. Daily and
+weekly notes are logs/evidence, not canonical task state. The JSONL sidecar
+ledger is audit/candidate history for identity repairs, ID-based completions,
+and completion evidence decisions.
+
+## Board mutation rule (CRITICAL — never hand-edit the board)
+
+The work board (`Weekly TODOs.md` / `TASK_TRACKER_WORK_FILE`) is mutated **only**
+through the task-tracker scripts. Never hand-create, overwrite, or hand-edit it
+with a file `write`/`edit`/`apply_patch` tool or shell `sed` — doing so strips
+`task_id::` metadata, creates duplicate task representations (a metadata-bearing
+section plus a bare "All Tasks" copy), and resurrects ledger-closed tasks as open,
+corrupting every standup, nag, and weekly review downstream.
+
+- **Add / complete / reschedule / cancel:** `python3 scripts/tasks.py add|done|reschedule|remove`
+  (assigns and preserves the canonical `task_id::`). `remove` cancels a task by
+  canonical id — it records a cancellation, not a completion (no `✅`, not counted
+  in done/velocity).
+- **Weekly rollover (creating the new week's board):** `python3 scripts/rollover.py`
+  — the deterministic, ledger-aware rollover. It carries forward open tasks with
+  their `task_id::` intact, never re-lists a ledger-closed task as open, and emits
+  one canonical priority-sectioned board (no duplicate "All Tasks" section). **Do
+  NOT** "compile the open tasks from last week" into a new board by hand — that is
+  exactly what corrupts it.
+- **One-time cleanup of an already-corrupted board** (dual representation, missing
+  IDs, resurrected-done): `python3 scripts/reconcile_board.py` (dry-run by default;
+  `--apply --repair` to write).
+
+If a board operation isn't covered by these scripts, surface it as a gap — do not
+improvise with a raw file write.
 
 ## When to Use
 
@@ -17,7 +50,34 @@ Use this skill when the user asks to:
 - Add, list, update, or complete tasks
 - Check blockers or due dates
 - Extract actions from meeting notes
-- Sync completed daily items to weekly todos
+- Report completed daily items against weekly todos without changing canonical
+  task state
+- Review completion evidence candidates before confirming task completion
+- Schedule freebusy-gated focus blocks for the day's priorities on an agent-owned
+  "Task Focus" calendar, send a morning brief / pre-brief / debrief, and propose
+  next week's priorities on Friday (U6 proactive layer; opt-in — degrades silently
+  when the focus calendar / `STANDUP_CALENDARS` are absent and never overbooks)
+
+## Proactive layer (U6)
+
+`scripts/proactive_brief.py --mode {brief,prebrief,slip,friday,create}` is the cron
+entry point for the proactive layer, plus `--mode debrief-capture --event-key <id>
+--notes "<notes>"` for the reactive `/debrief` path. Every push proves its delivery
+target FIRST (`prove_delivery_target` -> gated `act_id` -> `assert_send_target`) and
+lands only on the proven Productivity topic; an unset/wrong target blocks the push
+and sends nothing.
+
+- `create` places freebusy-gated focus blocks for the day's Defended Three (read
+  from U3's `focus-state.json`, never written by U6); `slip` slides a slipped block
+  to the next free window and notifies the user.
+- Calendar writes go through `scripts/calendar_blocks.py`, which freebusy-gates
+  every create/move against EXTERNAL calendars (an overlap OR an unknown freebusy
+  refuses the write — NEVER-OVERBOOK-EXTERNAL), slides a slipped block via
+  `gog calendar update` (never delete+create), and refuses to delete/move any
+  non-`agent_created` event (`ExternalEventError`).
+- State lives in `focus-calendar.json` and `proactive-state.json` (atomic,
+  torn-read safe — no duplicate briefs on a `*/5` scan; reactive `/debrief` capture
+  is idempotent on a closed loop).
 
 ## Quick Start
 
@@ -67,28 +127,80 @@ python3 scripts/personal_standup.py
 
 ```bash
 python3 scripts/tasks.py list
+python3 scripts/tasks.py list --plain
 python3 scripts/tasks.py list --priority high
 python3 scripts/tasks.py list --due today
 python3 scripts/tasks.py list --due this-week
+python3 scripts/tasks.py list --area openclaw
+python3 scripts/tasks.py list --search backup
 python3 scripts/tasks.py blockers
 ```
+
+`list` emits markdown pipe tables by default, grouped by section. Use `--plain`
+for legacy line-by-line output when piping the result into another script.
 
 ### Add and complete tasks
 
 ```bash
 python3 scripts/tasks.py add "Draft proposal" --priority high --due 2026-01-23
 python3 scripts/tasks.py --personal add "Call mom" --priority high --due 2026-01-22
-python3 scripts/tasks.py done "proposal"
-python3 scripts/tasks.py --personal done "call mom"
+python3 scripts/tasks.py identity-audit
+python3 scripts/tasks.py task-audit
+python3 scripts/tasks.py identity-repair --apply
+python3 scripts/tasks.py done "tsk_example"
+python3 scripts/tasks.py --personal done "tsk_personal"
+python3 scripts/tasks.py completion-candidates scan --file /tmp/done-log.md
+python3 scripts/tasks.py completion-candidates list
+python3 scripts/tasks.py completion-candidates confirm cand_example --task-id tsk_example
+python3 scripts/completion_inbox_control.py list
+python3 scripts/completion_inbox_control.py confirm cand_example --task-id tsk_example
 ```
 
-### State transitions and backlog ops
+Completion candidates are evidence suggestions. Scanning does not mutate active
+tasks; confirmation must resolve to a canonical `task_id::`. Workflow wrappers
+such as Telegram/Lobster should call `completion_inbox_control.py` or the
+`completion-candidates` command group by candidate ID. They must not call
+`done` by title, fuzzy match, fallback ID, quick ID, or list position.
+
+Task audits are read-only health checks. They can flag duplicate titles, stale
+active tasks, unresolved candidates, missing IDs, and backlog pressure, but they
+must not be treated as authority to freeze, delete, merge, or complete tasks.
+
+### Daily Priorities + capacity cap (Focus Core)
+
+Two layers (Decision #7):
+
+- **Layer 1 — Daily Top Priorities.** Each morning the agent proposes 2-3
+  must-do-today priorities (veto/approve). This is a *selection* over active
+  tasks; it surfaces and chases, it does not limit how many tasks exist.
+- **Layer 2 — Active-inventory cap.** `tasks add` is gated at write time: when the
+  active board's estimate-sum exceeds `WEEKLY_CAPACITY_HOURS` (default 25h;
+  unestimated tasks counted at `UNESTIMATED_TASK_HOURS`=2h) OR the active count
+  exceeds `ACTIVE_TASK_HARD_CAP` (default 20), a new add is blocked and nudged to
+  the parking lot. It NEVER force-evicts existing tasks. `--force-parking` routes
+  an over-cap add to the parking lot.
 
 ```bash
-python3 scripts/tasks.py state pause "task title" --until 2026-03-01
-python3 scripts/tasks.py state delegate "task title" --to Alex --followup 2026-03-01
-python3 scripts/tasks.py state backlog "task title"
-python3 scripts/tasks.py state drop "task title"
+# /focus*  → propose / approve / veto / override / status
+python3 scripts/focus_commands.py focus
+python3 scripts/focus_commands.py approve
+python3 scripts/focus_commands.py veto 2
+python3 scripts/focus_commands.py override
+python3 scripts/focus_commands.py status
+
+# Capacity cap on add (blocks before the board write when over capacity)
+python3 scripts/tasks.py add "New task"                 # blocked when over cap
+python3 scripts/tasks.py add "New task" --force-parking  # route to parking lot
+```
+
+Map `/focus`, `/focus-approve`, `/focus-veto <N>`, `/focus-override`, and
+`/focus-status` to these subcommands. The cap is date-independent (it governs
+total active load, not today's plan), so it applies even if the morning ritual is
+skipped; `focus-state.json` (Layer-1) is re-proposed each day.
+
+### Backlog ops
+
+```bash
 python3 scripts/tasks.py promote-from-backlog --cap 3
 python3 scripts/tasks.py review-backlog --stale-days 45 --json
 ```
@@ -114,40 +226,188 @@ bash scripts/task-shortcuts.sh done7d
 bash scripts/task-shortcuts.sh tasks     # quick priorities view
 ```
 
-### Karakeep inbox triage (Phase 3 MVP / Option 2)
+### Karakeep inbox triage
 
-Use these commands when links are being reviewed from Karakeep list `Todo` and must either complement an existing task, create a new task, or be routed to `Review`.
+Use these commands when links are reviewed from the Karakeep `Todo` list and
+must either complement an existing task, create a new task, or be routed to
+`Review`.
 
 ```bash
 python3 scripts/read_link.py read-bookmark --bookmark-id BOOKMARK_ID
 python3 scripts/karakeep_triage.py review-inbox --limit 5
 python3 scripts/karakeep_triage.py classify-bookmark --bookmark-id BOOKMARK_ID
-python3 scripts/karakeep_triage.py route-item --bookmark-id BOOKMARK_ID          # dry-run
-python3 scripts/karakeep_triage.py route-item --bookmark-id BOOKMARK_ID --apply  # mutate one item
+python3 scripts/karakeep_triage.py route-item --bookmark-id BOOKMARK_ID
+python3 scripts/karakeep_triage.py route-item --bookmark-id BOOKMARK_ID --apply
 python3 scripts/karakeep_cron_worker.py --state-file /home/ozp/clawd/agents/karakeep/memory/cron-state.json
 python3 scripts/karakeep_cron_summary.py --state-file /home/ozp/clawd/agents/karakeep/memory/cron-state.json --threshold 5 --human
 ```
 
 Rules:
+
 - `read_link.py` is the mandatory pre-classification reader.
 - `review-inbox` is read-only and bounded to a small slice.
 - `route-item` is dry-run by default; require `--apply` for mutation.
-- Default behavior is **Option 2**: deterministic baseline + semantic check through LiteLLM/ModelRelay, with disagreement biased to `Review`.
-- Use `--deterministic-only` when you want the old conservative control path.
-- Destination bookmark-state lists are `Incorporated` and `Review`; the inbox list is `Todo`.
+- Default behavior is deterministic baseline plus semantic check through
+  LiteLLM/FreeLLMAPI, with disagreement biased to `Review`.
+- Use `--deterministic-only` for the conservative control path.
+- Destination bookmark-state lists are `Incorporated` and `Review`; the inbox
+  list is `Todo`.
 - The implemented reader chain is `karakeep -> github_api -> fetch/trafilatura`.
-- Treat `mcphub`, browser-capable tools, and `playwriter` as reserved operational fallbacks when the implemented readers do not produce enough evidence for the active item.
-- Do not extend `read_link.py` with new reader layers during routine triage unless the user explicitly asks for implementation work.
-- For scheduled/background processing, keep the worker bounded to one inbox item per run and accumulate announcements through the cron state file instead of announcing every individual mutation.
+- For scheduled/background processing, keep the worker bounded to one inbox item
+  per run and accumulate announcements through the cron state file.
 
 ### EOD sync + weekly embed refresh
 
 ```bash
 python3 scripts/eod_sync.py --dry-run
 python3 scripts/eod_sync.py
+python3 scripts/eod_sync.py --apply   # legacy Weekly TODO checkbox write only
 python3 scripts/update_weekly_embeds.py --dry-run
 python3 scripts/update_weekly_embeds.py
 ```
+
+### Autonomy audit + undo (U2 — 🧭 Identity topic 1909)
+
+Reactive, owner-only commands that inspect or reverse a prior autonomous act.
+Both reply in-topic (origin-proven) and never push to Telegram themselves.
+
+```bash
+bash scripts/telegram-commands.sh audit            # list recent autonomous acts
+bash scripts/telegram-commands.sh audit act_<id>   # full detail for one act
+bash scripts/telegram-commands.sh undo act_<id>    # reverse a reversible act
+```
+
+- `/undo act_<id>` — undo a recent autonomous act (tiered window: 4h for a nag
+  ack, 7d for a board mutation). A board mutation is restored by re-inserting the
+  snapshot's exact `raw_line` via content search (not a line-number guess), so it
+  survives other edits to the board; a `nag_sent` act is undone by acking the nag
+  loop (`ack_type=user_undo`) so it will not re-fire.
+- `/audit` — list recent autonomous acts (act_id, type, task, target, status),
+  newest first; an already-undone act is flagged.
+
+As of v0.2 (U4), rung-3 proactive Telegram pushes are ENABLED at the gate
+(`autonomy_gate.RUNG3_PUSH_ENABLED=True`): a nag push executes only with a PROVEN,
+gated, asserted delivery target. The proof is unchanged — an unset env / wrong
+group / mismatched send is still blocked. Boot preflight (U1) must keep
+`autonomy-log.jsonl` writable for these.
+
+### Accountability / nag engine (U4 + U10 priority-first — Productivity Group)
+
+The nag engine chases overdue tasks until they are acknowledged. A nag is an open
+loop persisted in `nag-state.json`; it closes ONLY on an explicit ack
+(`/done`/`/reschedule`), a verified disappearance from the board, or a reschedule
+out of the overdue window — never silently, never on a crash, and a `/snooze`
+pauses but does NOT close it.
+
+```bash
+bash scripts/telegram-commands.sh nag-check            # cron pass (top-N worst, every ~3h, work hrs)
+bash scripts/telegram-commands.sh nag-check --dry-run  # preview, no state write / push
+bash scripts/telegram-commands.sh nag-check --all      # cron pass with NO display cap (fire every overdue)
+bash scripts/telegram-commands.sh nag                  # `/nag all`: read-only full overdue list (no fire)
+bash scripts/telegram-commands.sh done <task_id>             # complete + close loop (same turn)
+bash scripts/telegram-commands.sh reschedule <task_id> <date># move due:: + close loop
+bash scripts/telegram-commands.sh snooze <task_id> <dur>     # pause loop (cap: 3 snoozes)
+bash scripts/telegram-commands.sh body-double <task_id> <dur># focus session + check-ins
+bash scripts/telegram-commands.sh cancel-session <task_id>   # end a body-double session
+```
+
+- Q1-aware: thresholds are `NAG_Q1_THRESHOLD_DAYS=1`, `NAG_Q2_THRESHOLD_DAYS=3`,
+  `NAG_Q3_THRESHOLD_DAYS=7`, read off the scalar `overdue_days` because
+  `effective_priority()` short-circuits non-q2/q3 tasks to `escalated=False`.
+- Display cap (`NAG_DISPLAY_LIMIT=3`): the cron push fires only the N worst-overdue
+  tasks and appends a `+K more … reply /nag all` pointer, so an ADHD surface gets
+  the top few instead of an unbounded dump. It is a FIRING bound, not a mute —
+  deferred tasks open no loop that cycle but keep their place and surface as the
+  leaders clear; the close/recycle resolve pass is never capped. `/nag` (`/nag all`)
+  is the read-only full list; `nag-check --all` fires every overdue with no cap.
+- Every nag push goes through `prove_delivery_target()` →
+  `autonomy_gate.gate()` (act_id) → `assert_send_target()`. An unset
+  `TELEGRAM_CHAT_ID_PRODUCTIVITY` / `OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP` ⇒
+  `nag_delivery_blocked:env_missing` and the loop STAYS OPEN.
+- Delivery: each proven+gated+asserted nag text is emitted on `nag_check.py`'s
+  stdout, which the cron job's explicit `delivery.to`
+  (`${TELEGRAM_CHAT_ID_PRODUCTIVITY}:topic:${OPENCLAW_TOPIC_PRODUCTIVITY_STANDUP}`,
+  topic 2) announces. A nag is counted as sent only once its text is collected
+  for that announce — the script never logs `nag_sent` while delivering nothing.
+- `nag_check.py` is READ-ONLY on the board; all board mutations happen through the
+  reactive command path (`/done`, `/reschedule`).
+- Body-double check-ins are ephemeral one-shot crons with `deleteAfterRun:true`
+  and an explicit proven `delivery.to` + `agentId` set at session-start time.
+
+**v0.3 — priority-first + tappable (U10, U3):** the intraday nag now leads with
+**today's committed priorities** (the standup's `focus_state` daily 2-3 + the
+EOD-set tomorrow-pointer #1) that aren't done yet — eligible even at zero days
+overdue — each with a **▶️ Start** initiation button, then a reduced overdue tail.
+A *reweight*, not a volume increase: `NAG_DISPLAY_LIMIT`, the H5 cadence, and
+`/quiet` are unchanged. Each nag carries tap buttons (Done / Snooze 1d /
+Reschedule▸) instead of copy-paste IDs, and the duplicate-delivery hole is closed
+by a slot-bucketed idem-key (every fire of one cron slot — the scheduled fire, a
+retry, a manual run before the next slot — delivers exactly once). Taps route
+through the inline-button seam below.
+
+### EOD ritual (U4–U7 — Productivity Group Done topic)
+
+The end-of-day ritual is the canonical daily capture and the read side of the
+morning standup. `bash scripts/telegram-commands.sh eod` runs the guided flow:
+
+1. **Detect** — a read-only (`dry_run`) `done24h` harvest (merged PRs + sent mail
+   matched to the board + manual `/win`s); nothing is consumed.
+2. **Confirm** — each detected completion is a `✅ Confirm` button (`tt:appr`) that
+   drives the existing topic-guarded, reversible `approve` gate. No board change
+   without a tap.
+3. **Disposition** — every still-open task gets a Done / Carry / Reschedule / Drop
+   button row; an un-tapped task is reported "needs disposition" (the board is
+   never silently mutated). `carry`/`drop` are reversible via `/undo`.
+4. **Tomorrow's #1** — propose-then-confirm (`⭐ Set as #1`, `tt:top`) writes a
+   single atomic `tomorrow-pointer.json` that the morning standup opens with.
+
+The EOD delivers through the receipt-backed idempotent outbox (prove → gate →
+`deliver_once`), records `eod_review` health, and upserts an idempotent
+`## EOD Summary` (done / still-open / tomorrow's #1) to the Obsidian daily note —
+the JSONL ledger stays the canonical audit. Runs as a deterministic command cron
+(descriptor template in `eod_ritual.eod_cron_descriptor()`).
+
+### Inline-button UX (U1–U2)
+
+Telegram rituals are tappable instead of ID-typed. The **send** side
+(`telegram_buttons.py` + the receipt-backed outbox `--presentation`) attaches
+`tt:<action>:<task_id>` buttons; the **receive** side is a sideloaded gateway
+plugin (`scripts/openclaw-plugins/task-tracker-interactive/`, namespace `tt`) plus
+`callback_dispatch.py`, which route a tap into the **existing** deterministic
+commands (done / snooze / reschedule / carry / drop / approve / set-top / start).
+The plugin authorizes nothing — the skill command + topic guard are the single
+authority, so a forged/stale tap can only no-op. `callback_data` is hard-capped at
+64 bytes (over-budget → the button is dropped and the typed command survives).
+
+### Conversational completion assistant (KTD8)
+
+The gateway chat completion path is a sideloaded OpenClaw plugin plus the
+existing interactive `tt:done` callback path:
+
+- Plugin: `scripts/openclaw-plugins/task-tracker-envelope-signer/`
+- Resolver: `chat_capture.resolve_for_confirm()` ranks open-task candidates
+- Board write path: owner tap on `tt:done:<task_id>` handled by
+  `scripts/openclaw-plugins/task-tracker-interactive/`
+
+The plugin uses OpenClaw's broad `message_received` typed hook. That hook carries
+the inbound text plus sender id, channel, message id, timestamp, and thread
+metadata, and it is fire-and-forget so normal agent dispatch continues when the
+assistant cannot resolve a hint. It recognizes leading completion phrases
+(`done`, `finished`, `completed`, `did`, `✅`) and `/tasks` / `open`. Owner and
+chat-scope gates run before any resolve or post.
+
+Free-form prose is evidence only. A phrase such as `done the JAMS thing` may
+narrow to one or more open, non-objective, non-recurring tasks and post
+confirm/disambiguation buttons. The prose never writes the board, even for an
+exact single match. The only chat completion authority is the existing
+owner-authenticated `tt:done:<task_id>` tap/callback path. Human-visible labels
+and messages must show task titles only, never task ids.
+
+> **Operator step (required for the OpenClaw plugins to run):** register the
+> relevant plugin in `openclaw.json` `plugins.allow` + `entries`, boot-sync it as
+> REAL files into the AlphaClaw state root (never symlinks), and restart the
+> gateway. Until then the buttons render but taps are silent no-ops, and the chat
+> completion assistant does not observe inbound messages.
 
 ## Agent Invocation Guidance
 
@@ -171,6 +431,9 @@ Detailed docs moved to `references/`:
 
 ## Compatibility Notes
 
-- Existing scripts/commands are preserved; this is a docs structure refactor.
+- Active task mutations require canonical `task_id::` values; fallback IDs are
+  diagnostics only.
+- `scripts/eod_sync.py` is report-only by default. `--apply` is a legacy Weekly
+  TODO checkbox helper and does not complete canonical tasks.
 - Legacy file fallback (`TASK_TRACKER_LEGACY_FILE`) is still supported.
 - Migration guidance remains available in `references/migration.md`.

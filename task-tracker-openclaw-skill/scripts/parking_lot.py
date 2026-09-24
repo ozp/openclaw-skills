@@ -14,6 +14,7 @@ import json
 import os
 import re
 import tempfile
+import uuid
 from datetime import datetime, date
 from pathlib import Path
 
@@ -100,9 +101,35 @@ def _parse_items(lines: list[str], start: int, end: int) -> list[dict]:
                 priority = p
                 break
 
+        # Extract due (🗓️<date>) and owner (owner:: <value>) so a parked line that
+        # carries them (captured from an over-cap add, or parked-out by /swap) is
+        # self-describing -- /promote re-derives them from here to restore the
+        # active line (H6 Fix 2). Tolerated when absent.
+        due_match = re.search(r'🗓️\s*(\d{4}-\d{2}-\d{2})', body)
+        due = due_match.group(1) if due_match else None
+        owner_match = re.search(
+            r'(?<!\w)owner::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*#|$)', body
+        )
+        owner = owner_match.group(2).strip() if owner_match else None
+
+        # Extract estimate (estimate:: <value>) so a parked line carrying it
+        # (captured from an estimated active task, or parked-out by /swap) is
+        # self-describing -- /promote re-derives it from here to restore the
+        # active line's estimate, so the re-promoted task counts at its real
+        # estimate against the capacity cap (not the unestimated default).
+        estimate_match = re.search(
+            r'(?<!\w)estimate::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*🗓️|\s*#|$)', body
+        )
+        estimate = estimate_match.group(2).strip() if estimate_match else None
+
         # Clean title: strip bold, inline fields, tags
         title = body
         title = re.sub(r'\*\*(.+?)\*\*', r'\1', title)  # strip bold
+        title = re.sub(r'\s*🗓️\s*\d{4}-\d{2}-\d{2}', '', title)
+        title = re.sub(r'\s*owner::\s*[^\n]+?(?=\s+\w+::|\s*#|$)', '', title)
+        title = re.sub(r'\s*estimate::\s*[^\n]+?(?=\s+\w+::|\s*🗓️|\s*#|$)', '', title)
+        title = re.sub(r'\s*task_id::\s*\S+', '', title)
+        title = re.sub(r'\s*id::\s*\S+', '', title)
         title = re.sub(r'\s*created::\S+', '', title)
         title = re.sub(r'\s*stale::\S+', '', title)
         title = re.sub(r'\s*#\w+', '', title)
@@ -117,6 +144,9 @@ def _parse_items(lines: list[str], start: int, end: int) -> list[dict]:
             'stale': stale_date,
             'department': department,
             'priority': priority,
+            'due': due,
+            'owner': owner,
+            'estimate': estimate,
             'raw_line': line,
         })
     return items
@@ -146,6 +176,20 @@ def _is_stale(item: dict) -> bool:
     threshold = _parking_lot_stale_days()
     age = _days_since(item.get('created'))
     return age is not None and age >= threshold
+
+
+def _new_task_id() -> str:
+    return f"tsk_{uuid.uuid4().hex[:16]}"
+
+
+def _has_inline_id(line: str) -> bool:
+    return bool(re.search(r'\b(?:task_id|id)::\s*[A-Za-z0-9._:-]+', line))
+
+
+def _ensure_task_id(line: str, task_id: str | None = None) -> str:
+    if _has_inline_id(line):
+        return line
+    return f"{line.rstrip()} task_id::{task_id or _new_task_id()}"
 
 
 # ── Public API ───────────────────────────────────────────────
@@ -202,9 +246,66 @@ def list_stale(tasks_file: Path) -> str:
     return json.dumps(stale, indent=2)
 
 
+def audit_items(tasks_file: Path, *, cap: int | None = None) -> dict:
+    """Return read-only Parking Lot audit data."""
+    content = tasks_file.read_text()
+    lines = content.split('\n')
+    start, end = _find_parking_lot_bounds(lines)
+    effective_cap = cap if cap is not None else _parking_lot_cap()
+    if start == -1:
+        return {
+            'available': False,
+            'cap': effective_cap,
+            'total': 0,
+            'stale_count': 0,
+            'items': [],
+            'stale': [],
+        }
+
+    items = _parse_items(lines, start, end)
+    stale = []
+    exported = []
+    for it in items:
+        age_days = _days_since(it.get('created'))
+        row = {
+            'id': it['id'],
+            'title': it['title'],
+            'department': it.get('department'),
+            'priority': it.get('priority'),
+            'created': it.get('created'),
+            'age_days': age_days,
+            'line_number': (it.get('line_num') or 0) + 1,
+            'raw_line': it.get('raw_line'),
+        }
+        exported.append(row)
+        if _is_stale(it):
+            stale.append(row)
+
+    return {
+        'available': True,
+        'cap': effective_cap,
+        'total': len(items),
+        'stale_count': len(stale),
+        'items': exported,
+        'stale': stale,
+    }
+
+
 def add_item(tasks_file: Path, title: str, dept: str | None = None,
-             priority: str = 'low') -> str:
-    """Add an item to the parking lot. Returns status message."""
+             priority: str = 'low', task_id: str | None = None,
+             due: str | None = None, owner: str | None = None,
+             estimate: str | None = None) -> str:
+    """Add an item to the parking lot. Returns status message.
+
+    ``due``, ``owner`` and ``estimate`` are optional. When supplied they are
+    STORED on the parked line using the SAME ``🗓️<due>`` / ``owner:: <owner>`` /
+    ``estimate:: <estimate>`` tokens an active task line uses, so a captured or
+    parked-out task's due date / owner / estimate are self-describing on the
+    parked line and survive a later ``/promote`` (H6 Fix 2: "saved, not lost"
+    must not silently drop the due date, owner, or estimate -- dropping the
+    estimate also makes a re-promoted task under-count against the capacity cap).
+    Existing callers that pass none are unaffected -- no stray tokens are emitted.
+    """
     content = tasks_file.read_text()
     lines = content.split('\n')
     start, end = _find_parking_lot_bounds(lines)
@@ -220,6 +321,13 @@ def add_item(tasks_file: Path, title: str, dept: str | None = None,
     # Build task line
     today_str = date.today().isoformat()
     task_line = f'- [ ] **{title}**'
+    if due:
+        task_line += f' 🗓️{due}'
+    task_line = _ensure_task_id(task_line, task_id)
+    if owner:
+        task_line += f' owner:: {owner}'
+    if estimate:
+        task_line += f' estimate:: {estimate}'
     if dept:
         task_line += f' #{dept}'
     if priority and priority != 'low':
@@ -260,7 +368,7 @@ def promote_item(tasks_file: Path, item_id: int) -> str:
     promoted = removed_block[0]
     promoted = re.sub(r'\s*created::\S+', '', promoted)
     promoted = re.sub(r'\s*stale::\S+', '', promoted)
-    promoted = promoted.rstrip()
+    promoted = _ensure_task_id(promoted.rstrip())
     promoted_block = [promoted] + removed_block[1:]
 
     # Find insertion target: Objectives header > 🔴 header > before parking lot

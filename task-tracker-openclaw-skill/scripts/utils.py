@@ -13,11 +13,19 @@ Configuration via environment variables:
 import os
 import re
 import calendar
+import tempfile
 from datetime import datetime, timedelta, date
 from pathlib import Path
 import sys
 
-# Configurable paths with sensible defaults
+# Local-time "today" lives in cos_config (DRY single source of truth): the
+# cron fires in Pacific while the container clock is UTC, so a naive
+# datetime.now()/date.today() reads the UTC day and mis-classifies a
+# due-today task as overdue at Pacific evening. cos_config has no project
+# imports, so importing it here introduces no cycle.
+import cos_config
+
+# Configurable paths with sensible defaults.
 # Prefer the active OpenClaw workspace layout when present, then fall back to
 # the upstream Obsidian-oriented defaults for compatibility.
 DEFAULT_WORK_FILE = (
@@ -30,17 +38,85 @@ DEFAULT_PERSONAL_FILE = (
     if (Path.home() / "clawd" / "tasks" / "Personal Tasks.md").exists()
     else Path.home() / "Obsidian" / "03-Areas" / "Personal" / "Personal Tasks.md"
 )
-DEFAULT_LEGACY_WORK = Path.home() / "clawd" / "memory" / "work" / "TASKS.md"
 DEFAULT_ARCHIVE_DIR = (
     Path.home() / "clawd" / "tasks" / "archive"
     if (Path.home() / "clawd" / "tasks" / "archive").exists()
     else Path.home() / "clawd" / "memory" / "work"
 )
 
-OBSIDIAN_WORK = Path(os.getenv('TASK_TRACKER_WORK_FILE', DEFAULT_WORK_FILE))
-OBSIDIAN_PERSONAL = Path(os.getenv('TASK_TRACKER_PERSONAL_FILE', DEFAULT_PERSONAL_FILE))
-LEGACY_WORK = Path(os.getenv('TASK_TRACKER_LEGACY_FILE', DEFAULT_LEGACY_WORK))
-ARCHIVE_DIR = Path(os.getenv('TASK_TRACKER_ARCHIVE_DIR', DEFAULT_ARCHIVE_DIR))
+OBSIDIAN_WORK = Path(os.getenv(
+    'TASK_TRACKER_WORK_FILE',
+    DEFAULT_WORK_FILE
+))
+OBSIDIAN_PERSONAL = Path(os.getenv(
+    'TASK_TRACKER_PERSONAL_FILE',
+    DEFAULT_PERSONAL_FILE
+))
+LEGACY_WORK = Path(os.getenv(
+    'TASK_TRACKER_LEGACY_FILE',
+    Path.home() / "clawd" / "memory" / "work" / "TASKS.md"
+))
+ARCHIVE_DIR = Path(os.getenv(
+    'TASK_TRACKER_ARCHIVE_DIR',
+    DEFAULT_ARCHIVE_DIR
+))
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    """Write content atomically: temp file in the same dir + os.replace.
+
+    Promoted from parking_lot.py so every board/state writer can share one
+    crash-safe write mechanism. A partial/interrupted write never leaves the
+    destination truncated -- the temp file is renamed only after a complete
+    write, and os.replace is atomic on the same filesystem.
+
+    Mode handling: when the destination already exists its mode is preserved.
+    For a FRESH file (no existing mode) the temp file is left at an explicit
+    ``0o600`` -- never the inherited mkstemp default that could widen secret
+    state (autonomy log / nag state) on first write.
+
+    The write goes through a file object so a short write loops to completion
+    rather than silently truncating, and after the rename the PARENT DIRECTORY
+    is fsync'd so the rename itself survives a crash (the directory entry, not
+    just the file data, is durable).
+    """
+    path = Path(path)
+    existing_mode = None
+    try:
+        existing_mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'wb') as handle:
+            fd = -1  # ownership transferred to the file object
+            handle.write(content.encode('utf-8'))
+            handle.flush()
+            os.fsync(handle.fileno())
+        if existing_mode is not None:
+            os.chmod(tmp, existing_mode & 0o777)
+        else:
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    # Durability of the rename itself: fsync the parent directory. Best-effort --
+    # some filesystems/dirs reject O_RDONLY fsync; that is not fatal to the write.
+    try:
+        dir_fd = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 def get_current_quarter() -> str:
@@ -157,7 +233,7 @@ def _extract_tags_from_title(title: str) -> tuple[str, str | None, str | None]:
 def _split_plain_task_body(task_body: str) -> tuple[str, str]:
     """Split plain task body into title and metadata suffix."""
     marker_match = re.search(
-        r'\s+(🗓️\d{4}-\d{2}-\d{2}|📅\d{4}-\d{2}-\d{2}|📅\s+\d{4}-\d{2}-\d{2}|🔺|⏫|🔼|🔽|⏬|(?:area|goal|owner|blocks|type|recur|estimate|depends|sprint)::)',
+        r'\s+(🗓️\s*\d{4}-\d{2}-\d{2}|📅\d{4}-\d{2}-\d{2}|📅\s+\d{4}-\d{2}-\d{2}|🔺|⏫|🔼|🔽|⏬|(?:area|goal|owner|blocks|type|recur|estimate|depends|sprint|task_id|id)::)',
         task_body,
     )
     if marker_match:
@@ -222,9 +298,9 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
     current_department = None  # Track department from ### lines
     current_task = None
     current_objective = None
-    today = datetime.now().date()
-    
-    for line in content.split('\n'):
+    today = cos_config.local_today()  # local (Pacific) day for the due-today check below
+
+    for line_number, line in enumerate(content.split('\n'), start=1):
         # Detect section headers
         if line.startswith('## '):
             current_task = None
@@ -248,27 +324,18 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                     current_section = mapping.get(section_match.group(1)) if section_match else None
                     current_objective = None
             elif parsed_format in ('obsidian', 'legacy'):
-                if re.match(r'##\s+🅿️\s*Parking Lot\b', line, re.IGNORECASE) or re.match(
-                    r'##\s+Parking Lot\b',
-                    line,
-                    re.IGNORECASE,
-                ):
-                    current_section = 'parking_lot'
-                else:
-                    # Match emoji at start of section name (both formats use same emoji headers)
-                    section_match = re.match(r'## ([🔴🟡🟠👥⚪✅])', line)
-                    if section_match:
-                        emoji = section_match.group(1)
-                        current_section = mapping.get(emoji)
+                # Match emoji at start of section name (both formats use same emoji headers)
+                section_match = re.match(r'## ([🔴🟡🟠👥⚪✅])', line)
+                if section_match:
+                    emoji = section_match.group(1)
+                    current_section = mapping.get(emoji)
             continue
         
         # NEW: Handle ### sub-sections (e.g. ### 👥 Hiring #hiring)
         # These define the department for following tasks, not storage sections
         if line.startswith('### '):
-            # Extract department from ### line, e.g. ### 👥 Hiring #hiring
-            # Default to 'today' as storage section
-            current_section = 'today'
-            # Try to extract department from the line (e.g. "Hiring")
+            # Extract department from ### line for metadata, but preserve parent section
+            # Don't reset current_section - ### headers are organizational only
             section_match = re.match(r'###\s+[^\s]+\s+([A-Za-z]+)\s*#?', line)
             if section_match:
                 current_department = section_match.group(1).title()
@@ -307,14 +374,14 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
             area = None
             goal = None
             owner = None
-            note = None
-            note_meta = []
             blocks = None
             task_type = None
             recur = None
             estimate = None
             depends = None
             sprint = None
+            task_id = None
+            legacy_id = None
 
             department = None
             priority = None
@@ -332,9 +399,9 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 else:
                     current_objective = None
 
-            if parsed_format in ('obsidian', 'objectives'):
+            if parsed_format in ('obsidian', 'objectives', 'legacy'):
                 # Parse emoji date
-                date_match = re.search(r'🗓️(\d{4}-\d{2}-\d{2})', rest)
+                date_match = re.search(r'🗓️\s*(\d{4}-\d{2}-\d{2})', rest)
                 if date_match:
                     due_str = date_match.group(1)
                 
@@ -364,14 +431,6 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 if owner_match:
                     owner = owner_match.group(2).strip()
 
-                note_matches = [
-                    m.group(2).strip()
-                    for m in re.finditer(r'(?<!\w)note::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|$)', rest)
-                ]
-                if note_matches:
-                    note = note_matches[0]
-                    note_meta = note_matches
-
                 blocks_match = re.search(r'(?<!\w)blocks::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|$)', rest)
                 if blocks_match:
                     blocks = blocks_match.group(2).strip()
@@ -395,6 +454,14 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 sprint_match = re.search(r'(?<!\w)sprint::\s*(?!(\s|\w+::))([^\n]+?)(?=\s+\w+::|\s*🗓️|$)', rest)
                 if sprint_match:
                     sprint = sprint_match.group(2).strip()
+
+                task_id_match = re.search(r'(?<!\w)task_id::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])', rest)
+                if task_id_match:
+                    task_id = task_id_match.group(1).strip()
+
+                legacy_id_match = re.search(r'(?<!\w)id::\s*([A-Za-z0-9._:-]*[A-Za-z0-9._-])(?=\s|$|[),.;!?])', rest)
+                if legacy_id_match:
+                    legacy_id = legacy_id_match.group(1).strip()
             
             current_task = {
                 'title': title,
@@ -408,16 +475,17 @@ def parse_tasks(content: str, personal: bool = False, format: str = 'obsidian') 
                 'area': area,
                 'goal': goal,
                 'owner': owner,
-                'note': note,
-                'note_meta': note_meta,
                 'blocks': blocks,
                 'type': task_type,
                 'recur': recur,
                 'estimate': estimate,
                 'depends': depends,
                 'sprint': sprint,
+                'task_id': task_id,
+                'legacy_id': legacy_id,
                 'completed_date': completed_date,
                 'raw_line': line,
+                'line_number': line_number,
             }
             
             result['all'].append(current_task)
@@ -489,8 +557,8 @@ def check_due_date(due: str, check_type: str = 'today') -> bool:
     """Check if a due date matches the given type."""
     if not due:
         return False  # Tasks without due dates don't match any filter
-    
-    today = datetime.now().date()
+
+    today = cos_config.local_today()  # local (Pacific) day: this is the overdue/today/this-week classifier
     week_end = today + timedelta(days=(6 - today.weekday()))
     
     try:
@@ -627,10 +695,10 @@ def get_missed_tasks(tasks_data: dict, lookback_days: int = 1, reference_date: s
         try:
             today = datetime.strptime(reference_date, '%Y-%m-%d').date()
         except ValueError:
-            today = datetime.now().date()
+            today = cos_config.local_today()
     else:
-        today = datetime.now().date()
-    
+        today = cos_config.local_today()
+
     start_date = today - timedelta(days=lookback_days)
     end_date = today - timedelta(days=1)
 
@@ -667,9 +735,9 @@ def get_missed_tasks_bucketed(tasks_data: dict, reference_date: str = None) -> d
         try:
             today = datetime.strptime(reference_date, '%Y-%m-%d').date()
         except ValueError:
-            today = datetime.now().date()
+            today = cos_config.local_today()
     else:
-        today = datetime.now().date()
+        today = cos_config.local_today()
 
     yesterday = today - timedelta(days=1)
     last_week = today - timedelta(days=7)
@@ -736,14 +804,16 @@ def effective_priority(task: dict, reference_date=None) -> dict:
     due_str = task.get('due')
     original_section = section
 
-    # Resolve reference date
+    # Resolve reference date. The default "today" is the local (Pacific) day:
+    # this drives the overdue-escalation thresholds below, which a UTC day
+    # (rolled over by the Pacific-evening cron) would trigger a day early.
     if reference_date is None:
-        ref = _dt.now().date()
+        ref = cos_config.local_today()
     elif isinstance(reference_date, str):
         try:
             ref = _dt.strptime(reference_date, '%Y-%m-%d').date()
         except ValueError:
-            ref = _dt.now().date()
+            ref = cos_config.local_today()
     else:
         ref = reference_date
 
